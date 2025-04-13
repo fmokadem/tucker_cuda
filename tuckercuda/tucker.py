@@ -16,8 +16,7 @@ except ImportError as e:
 # Define the data type consistently (must match 'real' in C++)
 DTYPE = np.float32
 
-# Try importing tensorly for HOSVD initialization, but don't fail if not present
-# We only need it if the user explicitly requests init='svd'
+# Try importing tensorly for HOSVD initialization if requested
 try:
     import tensorly as tl
     from tensorly.decomposition import tucker as tl_tucker # For SVD init
@@ -28,179 +27,16 @@ except ImportError:
     tl_tucker = None
 
 
-def _validate_tucker_inputs(
-    tensor: np.ndarray,
-    rank: Union[int, Sequence[int]],
-    modes: Optional[Sequence[int]] = None,
-    n_iter_max: int = 100,
-    init: Union[Literal['svd', 'random'], Tuple[np.ndarray, List[np.ndarray]], List[np.ndarray]] = 'random',
-    tol: float = 1e-5,
-    random_state: Optional[Union[int, np.random.RandomState]] = None,
-    verbose: bool = False,
-    return_errors: bool = False
-) -> Tuple[np.ndarray, List[int], List[int], List[int], List[np.ndarray]]:
-    """Internal helper to validate inputs and prepare initial factors.
-
-    Checks backend limitations (4D only).
-    Returns: (tensor_contig, X_dims, R_dims_in, R_dims_clamped, initial_factors)
-    """
-    if not isinstance(tensor, np.ndarray):
-        raise TypeError("Input tensor must be a NumPy ndarray.")
-
-    # --- Backend Limitation Check ---
-    if tensor.ndim != 4:
-        raise NotImplementedError(
-            f"The 'tucker_cuda' backend currently only supports 4-dimensional tensors, "
-            f"but the input tensor has {tensor.ndim} dimensions."
-        )
-    ndim = 4
-    X_dims = list(tensor.shape)
-
-    # --- Rank Handling ---
-    if isinstance(rank, int):
-        # If single int, repeat for all modes
-        message = f"Single rank passed: {rank}. Using this rank for all {ndim} modes."
-        warnings.warn(message, UserWarning)
-        R_dims = [rank] * ndim
-    elif len(rank) == ndim:
-        R_dims = list(rank)
-    else:
-        raise ValueError(
-            f"Invalid 'rank': expected an integer or a sequence of length {ndim} "
-            f"(tensor dimensions), but got {rank}."
-        )
-
-    # Check ranks are positive integers
-    if not all(isinstance(r, int) and r > 0 for r in R_dims):
-        raise ValueError(f"Target ranks must be positive integers, but got {R_dims}")
-
-    # Keep original requested ranks
-    R_dims_in = list(R_dims) # Store original request
-
-    # Clamp ranks (required for initial factor generation shape)
-    R_dims_clamped = [min(I, R) for I, R in zip(X_dims, R_dims)]
-
-    # --- Parameter Validation for CUDA backend --- 
-    if return_errors:
-        raise NotImplementedError("'return_errors=True' is not supported by the tucker_cuda backend.")
-    if modes is not None:
-        # This validation is primarily for partial_tucker, but check here too
-        if sorted(list(set(modes))) != sorted(modes) or any(m < 0 or m >= ndim for m in modes):
-             raise ValueError(f"Invalid 'modes': {modes}. Must be unique modes within [0, {ndim-1}] ")
-        # For full tucker, rank must be sequence of length ndim or single int
-        # Validation already done above
-        # if len(R_dims) != len(modes):
-        #     raise ValueError("Number of ranks must match number of modes for partial Tucker.")
-
-    # Ensure tensor dtype matches backend expectation
-    if tensor.dtype != DTYPE:
-        warnings.warn(f"Input tensor dtype ({tensor.dtype}) differs from backend expectation ({DTYPE}). Casting to {DTYPE}.", UserWarning)
-        tensor = tensor.astype(DTYPE)
-    if not tensor.flags.c_contiguous:
-        warnings.warn("Input tensor is not C-contiguous. Creating a C-contiguous copy.", UserWarning)
-        tensor = np.ascontiguousarray(tensor)
-
-    # --- Initialization --- #
-    initial_factors: List[np.ndarray] = [] # Ensure it's defined
-    if isinstance(init, str):
-        init_method = init.lower()
-        if init_method == 'random':
-            if verbose:
-                print("Initializing factors randomly (orthogonalized via QR)")
-            rng = np.random.RandomState(random_state) if not isinstance(random_state, np.random.RandomState) else random_state
-            # initial_factors = [] # Already defined
-            for n in range(ndim):
-                rows = X_dims[n]
-                cols = R_dims_clamped[n]
-                # Generate random matrix
-                A = rng.standard_normal((rows, cols)).astype(DTYPE)
-                # QR decomposition for orthogonalization
-                if rows >= cols:
-                    Q, _ = np.linalg.qr(A)
-                    # Q has shape (rows, rows), take first 'cols' columns
-                    factor = np.ascontiguousarray(Q[:, :cols])
-                else:
-                    # More columns than rows - cannot generate full orthonormal matrix
-                    # Generate random and normalize columns (less ideal but provides guess)
-                    # Note: HOOI itself ensures orthogonality later via SVD
-                    warnings.warn(f"Mode {n}: Rank ({cols}) > Dimension ({rows}). Generating random columns, not strictly orthogonal.", UserWarning)
-                    factor = A / np.linalg.norm(A, axis=0)[np.newaxis, :]
-                    factor = np.ascontiguousarray(factor)
-
-                initial_factors.append(factor)
-
-        elif init_method == 'svd':
-            if verbose:
-                print("Initializing factors via HOSVD (using TensorLy if available)")
-            if not _TENSORLY_AVAILABLE:
-                raise ImportError("Initialization method 'svd' requires the TensorLy library, which was not found.")
-            # Use TensorLy's tucker with HOSVD init (0 iterations) just for factors
-            try:
-                _, hosvd_factors = tl_tucker(
-                    tensor, rank=R_dims_in, init='svd', n_iter_max=0, # Get HOSVD factors
-                    # modes=modes if modes else list(range(ndim)), # Use clamped ranks for HOSVD?
-                    normalize_factors=True # Standard HOSVD
-                )
-                # Ensure factors are correct dtype and contiguous, and correct shape
-                initial_factors = []
-                for n in range(ndim):
-                     # HOSVD factors might not match clamped rank if I < R
-                     factor_temp = np.ascontiguousarray(hosvd_factors[n], dtype=DTYPE)
-                     if factor_temp.shape != (X_dims[n], R_dims_clamped[n]):
-                         # This can happen if R_dims_in[n] > X_dims[n]
-                         # Take appropriate slice
-                         factor = factor_temp[:, :R_dims_clamped[n]]
-                     else:
-                         factor = factor_temp
-                     initial_factors.append(np.ascontiguousarray(factor))
-
-            except Exception as e:
-                raise RuntimeError(f"TensorLy HOSVD initialization failed: {e}") from e
-
-        else:
-            raise ValueError(f"Initialization method '{init}' not recognized. Use 'random', 'svd', or provide initial factors.")
-
-    elif isinstance(init, (list, tuple)):
-        temp_factors: List[np.ndarray] = []
-        # Check if it's a list of factors or a (core, factors) tuple
-        if len(init) == ndim and isinstance(init[0], np.ndarray):
-            if verbose:
-                print("Using provided list of factors for initialization.")
-            temp_factors = init
-        elif len(init) == 2 and isinstance(init[0], np.ndarray) and isinstance(init[1], (list, tuple)):
-             if verbose:
-                 print("Using provided (core, factors) tuple for initialization.")
-             temp_factors = init[1]
-        else:
-            raise TypeError("Invalid 'init': If list/tuple, must be list of factors or (core, factors) tuple.")
-
-        if len(temp_factors) != ndim:
-             raise ValueError(f"Invalid 'init': Expected {ndim} factor matrices, got {len(temp_factors)}.")
-
-        initial_factors = []
-        for n in range(ndim):
-            factor_temp = np.ascontiguousarray(temp_factors[n], dtype=DTYPE)
-            if factor_temp.shape != (X_dims[n], R_dims_clamped[n]):
-                 raise ValueError(f"Provided factor matrix for mode {n} has incorrect shape. Expected {(X_dims[n], R_dims_clamped[n])}, got {factor_temp.shape}.")
-            initial_factors.append(factor_temp)
-
-    else:
-        raise TypeError(f"Invalid 'init' type: {type(init)}. Use 'random', 'svd', or provide initial factors.")
-
-    # Return validated tensor, dimensions, original ranks, clamped ranks, and initial factors
-    return tensor, X_dims, R_dims_in, R_dims_clamped, initial_factors
-
-
 def tucker(
     tensor: np.ndarray,
     rank: Union[int, Sequence[int]],
     n_iter_max: int = 100,
-    init: Union[Literal['svd', 'random'], Tuple[np.ndarray, List[np.ndarray]], List[np.ndarray]] = 'random',
     tol: float = 1e-6,
-    random_state: Optional[Union[int, np.random.RandomState]] = None,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, List[np.ndarray]]:
     """Tucker decomposition via HOOI algorithm accelerated with CUDA.
+
+    Backend uses internal HOSVD initialization.
 
     Parameters
     ----------
@@ -210,13 +46,8 @@ def tucker(
         Desired target ranks for each mode.
     n_iter_max : int, optional
         Maximum number of HOOI iterations, by default 100.
-    init : {'svd', 'random'} or List[np.ndarray] or Tuple[np.ndarray, List[np.ndarray]], optional
-        Initialization method or initial factors, by default 'random'.
-        'svd' requires TensorLy.
     tol : float, optional
         Convergence tolerance, by default 1e-6.
-    random_state : int or np.random.RandomState, optional
-        Seed for 'random' initialization, by default None.
     verbose : bool, optional
         Whether to print progress messages, by default False.
 
@@ -229,59 +60,81 @@ def tucker(
 
     Raises
     ------
-    TypeError
-        If inputs are invalid types.
-    ValueError
-        If inputs have invalid values (e.g., ranks, shapes).
-    NotImplementedError
-        If input tensor is not 4D (backend limitation).
-    ImportError
-        If init='svd' is used and TensorLy is not installed.
-    RuntimeError
-        If the underlying CUDA computation fails.
+    TypeError, ValueError, NotImplementedError, RuntimeError
+        If input validation fails or backend encounters an error.
     """
     if verbose:
         print("--- Running CUDA Tucker Decomposition ---")
         start_time = time.time()
 
-    # Validate inputs and generate initial factors
     try:
-        tensor_contig, X_dims, R_dims_in, R_dims_clamped, initial_factors = _validate_tucker_inputs(
-            tensor=tensor, rank=rank, modes=None, n_iter_max=n_iter_max, init=init,
-            tol=tol, random_state=random_state, verbose=verbose, return_errors=False
-        )
-    except (ValueError, TypeError, NotImplementedError, ImportError) as e:
-        raise e # Re-raise validation errors
+        # --- Input Validation (moved from _validate_tucker_inputs) ---
+        if not isinstance(tensor, np.ndarray):
+            raise TypeError("Input tensor must be a NumPy ndarray.")
 
-    if verbose:
-        print("Input validation and initialization complete.")
-        print(f"Input shape: {X_dims}, Target Ranks: {R_dims_in}, Clamped Ranks: {R_dims_clamped}")
-        print("Calling CUDA backend...")
+        if tensor.ndim != 4:
+            raise NotImplementedError(
+                f"The 'tucker_cuda' backend currently only supports 4-dimensional tensors, "
+                f"but the input tensor has {tensor.ndim} dimensions."
+            )
+        ndim = 4
+        X_dims = list(tensor.shape)
 
-    # Call the pybind11 wrapper for the CUDA function
-    try:
-        cuda_start_time = time.time()
+        if isinstance(rank, int):
+            warnings.warn(f"Single rank passed: {rank}. Using this rank for all {ndim} modes.", UserWarning)
+            R_dims = [rank] * ndim
+        elif len(rank) == ndim:
+            R_dims = list(rank)
+        else:
+            raise ValueError(
+                f"Invalid 'rank': expected an integer or a sequence of length {ndim} "
+                f"(tensor dimensions), but got {rank}."
+            )
+
+        if not all(isinstance(r, int) and r > 0 for r in R_dims):
+            raise ValueError(f"Target ranks must be positive integers, but got {R_dims}")
+
+        R_dims_in = list(R_dims) # Keep original request
+
+        if tensor.dtype != DTYPE:
+            warnings.warn(f"Input tensor dtype ({tensor.dtype}) differs from backend expectation ({DTYPE}). Casting to {DTYPE}.", UserWarning)
+            tensor = tensor.astype(DTYPE)
+        if not tensor.flags.c_contiguous:
+            warnings.warn("Input tensor is not C-contiguous. Creating a C-contiguous copy.", UserWarning)
+            tensor = np.ascontiguousarray(tensor)
+        # --- End Validation ---
+
+        if verbose:
+             # Clamped ranks are computed internally but not needed here
+             print(f"Input Shape: {X_dims}, Target Ranks: {R_dims_in}")
+             print(f"Calling tucker_cuda.hooi with tolerance={tol:.1e}, max_iterations={n_iter_max}")
+
+        # Call the backend C++/CUDA function (no initial factors passed)
         core_tensor, computed_factors = tucker_cuda.hooi(
-            h_X_np=tensor_contig,
+            h_X_np=tensor,
             X_dims=X_dims,
-            h_A_np_list=initial_factors,
-            R_dims=R_dims_in, # Pass original target ranks
+            R_dims=R_dims_in,
             tolerance=tol,
             max_iterations=n_iter_max
         )
-        cuda_end_time = time.time()
+
         if verbose:
-            print(f"CUDA backend execution time: {cuda_end_time - cuda_start_time:.4f} seconds")
-            total_time = time.time() - start_time
-            print(f"Total function time: {total_time:.4f} seconds")
+            end_time = time.time()
+            print(f"Tucker decomposition finished in {end_time - start_time:.4f} seconds.")
+            print(f"Output Core Shape: {core_tensor.shape}")
+            for i, f in enumerate(computed_factors):
+                print(f"Output Factor {i} Shape: {f.shape}")
 
-    except RuntimeError as e:
-        raise RuntimeError(f"CUDA backend execution failed: {e}") from e
+        return core_tensor, computed_factors
 
-    # Return the results
-    return core_tensor, computed_factors
+    except (TypeError, ValueError, NotImplementedError, RuntimeError) as e:
+        raise e # Re-raise exceptions from validation or backend
+    except Exception as e:
+        raise RuntimeError(f"An unexpected error occurred during Tucker decomposition: {e}") from e
 
-
+# --- Placeholder for Partial Tucker ---
+# The current CUDA backend only supports full Tucker decomposition (all modes).
+# If partial Tucker support were added to the backend, this function could call it.
 def partial_tucker(
     tensor: np.ndarray,
     rank: Union[int, Sequence[int]],
@@ -292,12 +145,52 @@ def partial_tucker(
     random_state: Optional[Union[int, np.random.RandomState]] = None,
     verbose: bool = False,
 ) -> Tuple[np.ndarray, List[np.ndarray]]:
-    """Partial Tucker decomposition (not implemented in this backend).
+    """Computes partial Tucker decomposition for specified modes.
 
-    Raises:
-        NotImplementedError: Always raises, as this backend only supports full Tucker.
+    NOTE: This function is currently a placeholder as the 'tucker_cuda' backend
+          only supports full (4D) decomposition.
+
+    Parameters
+    ----------
+    tensor : np.ndarray
+        Input tensor (must be 4D and float32).
+    rank : int or Sequence[int]
+        Desired target ranks for the modes specified in `modes`.
+        If int, used for all modes in `modes`.
+        If sequence, length must match `modes`.
+    modes : Sequence[int]
+        Modes along which to perform the decomposition.
+    n_iter_max : int, optional
+        Maximum number of HOOI iterations, by default 100.
+    init : {'svd', 'random'} or List[np.ndarray] or Tuple[np.ndarray, List[np.ndarray]], optional
+        Initialization method or initial factors for the specified modes, by default 'random'.
+    tol : float, optional
+        Convergence tolerance, by default 1e-6.
+    random_state : int or np.random.RandomState, optional
+        Seed for 'random' initialization, by default None.
+    verbose : bool, optional
+        Whether to print progress messages, by default False.
+
+    Returns
+    -------
+    Tuple[np.ndarray, List[np.ndarray]]
+        (core_tensor, factors)
+        Core tensor has ranks `rank` along `modes` and original size otherwise.
+        Factors is a list corresponding to the `modes`.
+
+    Raises
+    ------
+    NotImplementedError
+        Always raised, as the backend doesn't support partial decomposition.
     """
-    raise NotImplementedError("partial_tucker is not supported by the 'tucker_cuda' backend. Use the full tucker decomposition.")
+    raise NotImplementedError(
+        "Partial Tucker decomposition is not supported by the 'tucker_cuda' backend. "
+        "Only full 4D decomposition is available via tucker()."
+    )
+
+# TODO: Add reconstruction function `tucker_to_tensor` if needed?
+#       Requires n-mode product, could potentially call backend if exposed,
+#       or use tensorly.tenalg.multi_mode_dot if tensorly is available.
 
 # Example basic usage (can be run if module is imported)
 if __name__ == '__main__':

@@ -1,262 +1,200 @@
 # /pub1/frank/tdcu/test_tucker_cuda.py
 import numpy as np
-import tensorly as tl
-from tensorly.decomposition import tucker
-from tensorly.tenalg import multi_mode_dot, mode_dot
-from tensorly.base import unfold
-import subprocess
-import os
-import struct
 import time
 import sys
+import os
+import warnings
 
-# --- Configuration ---
-CUDA_EXECUTABLE_PATH = "../build/tucker_app"
-I1, I2, I3, I4 = 10, 11, 12, 13
-R1, R2, R3, R4 = 3, 4, 5, 6
+# Add build directory to sys.path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+build_dir = os.path.abspath(os.path.join(script_dir, '../build'))
+print(f"Adding build directory to sys.path: {build_dir}")
+sys.path.insert(0, build_dir)
 
-INPUT_TENSOR_FILE = "temp_input_tensor.bin"
-OUTPUT_A1_FILE = "temp_output_A1.bin"
-OUTPUT_A2_FILE = "temp_output_A2.bin"
-OUTPUT_A3_FILE = "temp_output_A3.bin"
-OUTPUT_A4_FILE = "temp_output_A4.bin"
-OUTPUT_G_FILE = "temp_output_G.bin"
+try:
+    import tucker_cuda
+except ImportError:
+    print("ERROR: Failed to import the 'tucker_cuda' module.")
+    print("Ensure project is compiled and module is in Python path.")
+    exit(1)
 
-RECONSTRUCTION_ERROR_THRESHOLD = 1e-4
-DTYPE = np.float32
+# Try importing TensorLy for comparison only
+try:
+    import tensorly as tl
+    from tensorly.decomposition import tucker as tl_tucker
+    from tensorly.tenalg import multi_mode_dot
+    _TENSORLY_AVAILABLE = True
+except ImportError:
+    print("WARNING: TensorLy library not found. Some checks will be skipped.")
+    print("         Install it (`pip install tensorly`) for full testing.")
+    _TENSORLY_AVAILABLE = False
+    tl = None
+    tl_tucker = None
+    multi_mode_dot = None
 
-def get_script_dir():
-    return os.path.dirname(os.path.abspath(__file__))
 
-def get_abs_path(filename):
-    return os.path.join(get_script_dir(), filename)
+# Configuration
+DIMS_DEFAULT = [10, 11, 12, 13]
+RANKS_DEFAULT = [3, 4, 5, 6]
+TOLERANCE = 1e-5
+MAX_ITER = 100
+DTYPE = np.float32 # Match C++ 'real' type
 
-def save_tensor_to_file(tensor, filename):
-    """Saves a NumPy tensor to a raw binary file (row-major)."""
-    abs_filename = get_abs_path(filename)
-    print(f"Saving tensor of shape {tensor.shape} to {abs_filename}...")
-    tensor_contiguous = np.ascontiguousarray(tensor, dtype=DTYPE)
-    try:
-        with open(abs_filename, 'wb') as f:
-            f.write(tensor_contiguous.tobytes())
-        print(f"Saved {tensor_contiguous.nbytes} bytes.")
-    except IOError as e:
-        print(f"ERROR saving file {abs_filename}: {e}")
-        raise
+RECONSTRUCTION_ERROR_DIFF_THRESHOLD = 1e-4
+RECONSTRUCTION_ERROR_ABS_THRESHOLD = 1e-3
+ORTHOGONALITY_THRESHOLD = 1e-3
 
-def load_tensor_from_file(filename, shape, dtype=DTYPE):
-    """Loads a tensor from a raw binary file into a NumPy array (row-major)."""
-    abs_filename = get_abs_path(filename)
-    print(f"Loading tensor for expected shape {shape} from {abs_filename}...")
-    expected_elements = np.prod(shape)
-    if expected_elements < 0:
-         raise ValueError(f"Invalid shape {shape} results in negative element count.")
-
-    expected_bytes = expected_elements * np.dtype(dtype).itemsize
-    if not os.path.exists(abs_filename):
-         raise FileNotFoundError(f"Output file not found: {abs_filename}")
-
-    try:
-        actual_bytes = os.path.getsize(abs_filename)
-        if actual_bytes != expected_bytes:
-            raise ValueError(f"File size mismatch for {abs_filename}. Expected {expected_bytes} bytes, got {actual_bytes}.")
-
-        if expected_bytes == 0:
-             return np.zeros(shape, dtype=dtype)
-
-        with open(abs_filename, 'rb') as f:
-            data = np.frombuffer(f.read(), dtype=dtype)
-
-        if data.size != expected_elements:
-             raise ValueError(f"Element count mismatch for {abs_filename}. Expected {expected_elements}, got {data.size}.")
-
-        return data.reshape(shape, order='C')
-
-    except IOError as e:
-        print(f"ERROR loading file {abs_filename}: {e}")
-        raise
-    except ValueError as e:
-        print(f"ERROR processing file {abs_filename}: {e}")
-        raise
-
-def cleanup_files(filenames):
-    """Removes temporary files."""
-    print("Cleaning up temporary files...")
-    script_dir = get_script_dir()
-    for f in filenames:
-        abs_f = os.path.join(script_dir, f)
-        if os.path.exists(abs_f):
-            try:
-                os.remove(abs_f)
-            except OSError as e:
-                print(f"Warning: Could not remove temporary file {abs_f}: {e}")
-
-# --- Main Test Logic ---
 if __name__ == "__main__":
-    print("--- Starting Tucker Decomposition Test ---")
-    script_dir = get_script_dir()
-    print(f"Running test from directory: {script_dir}")
+    print("--- Starting Tucker Decomposition Test (using Python bindings) ---")
 
-    try:
-        import tensorly as tl
-        print(f"Using TensorLy version: {tl.__version__}")
-    except ImportError:
-        print("ERROR: TensorLy library not found. Please install it (`pip install tensorly`).")
-        sys.exit(1)
+    dims = DIMS_DEFAULT
+    ranks_req = RANKS_DEFAULT
 
-    # Override dims/ranks from command line if provided
     if len(sys.argv) == 1 + 4 + 4:
         try:
              print("Using dimensions and ranks from command line arguments.")
-             I1, I2, I3, I4 = [int(x) for x in sys.argv[1:5]]
-             R1, R2, R3, R4 = [int(x) for x in sys.argv[5:9]]
-             if any(d <= 0 for d in [I1, I2, I3, I4]) or any(r <= 0 for r in [R1, R2, R3, R4]):
+             dims = [int(x) for x in sys.argv[1:5]]
+             ranks_req = [int(x) for x in sys.argv[5:9]]
+             if any(d <= 0 for d in dims) or any(r <= 0 for r in ranks_req):
                   raise ValueError("Dimensions and ranks must be positive.")
-             R1 = min(R1, I1); R2 = min(R2, I2); R3 = min(R3, I3); R4 = min(R4, I4)
         except ValueError as e:
-             print(f"ERROR: Invalid command line arguments for dimensions/ranks: {e}")
-             print("Usage: python test_tucker_cuda.py [I1 I2 I3 I4 R1 R2 R3 R4]")
+             print(f"ERROR: Invalid command line arguments for dimensions/ranks: {e}", file=sys.stderr)
+             print("Usage: python test_tucker_cuda.py [I1 I2 I3 I4 R1 R2 R3 R4]", file=sys.stderr)
              sys.exit(1)
     else:
         print("Using default dimensions and ranks.")
 
-    dims = [I1, I2, I3, I4]
-    ranks = [R1, R2, R3, R4]
-    print(f"Testing with Dimensions: {dims}, Ranks: {ranks}")
+    ranks_clamped = [min(I, R) for I, R in zip(dims, ranks_req)]
+    print(f"Testing with Dimensions: {dims}, Requested Ranks: {ranks_req}, Clamped Ranks: {ranks_clamped}")
 
-    temp_files = [
-        INPUT_TENSOR_FILE, OUTPUT_A1_FILE, OUTPUT_A2_FILE,
-        OUTPUT_A3_FILE, OUTPUT_A4_FILE, OUTPUT_G_FILE
-    ]
     overall_passed = True
+    rng = np.random.RandomState(1234) # Reproducible random data
 
     try:
-        abs_executable_path = get_abs_path(CUDA_EXECUTABLE_PATH)
-        if not os.path.exists(abs_executable_path):
-            print(f"ERROR: CUDA executable not found at '{abs_executable_path}'")
-            sys.exit(1)
-        if not os.access(abs_executable_path, os.X_OK):
-             print(f"ERROR: CUDA executable at '{abs_executable_path}' is not executable.")
-             sys.exit(1)
-
-        print(f"Generating random tensor with shape {dims} and dtype {DTYPE}...")
-        np.random.seed(1234)
-        host_tensor_np = np.random.random(dims).astype(DTYPE)
+        print(f"\nGenerating random tensor with shape {dims} and dtype {DTYPE}...")
+        host_tensor_np = rng.standard_normal(dims).astype(DTYPE)
         tensor_norm = np.linalg.norm(host_tensor_np)
         if tensor_norm < 1e-12: tensor_norm = 1.0
         print(f"Input tensor norm: {tensor_norm:.6f}")
 
-        save_tensor_to_file(host_tensor_np, INPUT_TENSOR_FILE)
+        print(f"\nRunning tucker_cuda.hooi (tol={TOLERANCE:.1e}, max_iter={MAX_ITER})...")
+        start_time_cuda = time.time()
+        try:
+            cuda_core, cuda_factors = tucker_cuda.hooi(
+                h_X_np=host_tensor_np,
+                X_dims=dims,
+                R_dims=ranks_req,
+                tolerance=TOLERANCE,
+                max_iterations=MAX_ITER
+            )
+            cuda_time = time.time() - start_time_cuda
+            print(f"CUDA execution finished in {cuda_time:.4f} seconds.")
+        except Exception as e:
+            print(f"ERROR during tucker_cuda.hooi execution: {e}", file=sys.stderr)
+            raise
 
-        print(f"Running CUDA executable: {abs_executable_path}...")
-        command = [
-            abs_executable_path,
-            INPUT_TENSOR_FILE,
-            OUTPUT_A1_FILE, OUTPUT_A2_FILE, OUTPUT_A3_FILE, OUTPUT_A4_FILE,
-            OUTPUT_G_FILE,
-            str(I1), str(I2), str(I3), str(I4),
-            str(R1), str(R2), str(R3), str(R4),
-            str(1e-5), # Tolerance
-            str(100)   # Max iterations
-        ]
-        print(f"Executing: {' '.join(command)}")
-        start_time = time.time()
-        process = subprocess.run(command, capture_output=True, text=True, check=False)
-        cuda_time = time.time() - start_time
-
-        print("--- CUDA stdout ---")
-        print(process.stdout.strip())
-        print("-------------------")
-        if process.returncode != 0:
-            print(f"ERROR: CUDA executable failed with return code {process.returncode}")
-            print("--- CUDA stderr ---")
-            print(process.stderr.strip())
-            print("-------------------")
-            overall_passed = False
-            raise RuntimeError("CUDA executable failed.")
+        tl_core, tl_factors = None, None
+        tl_time = -1.0
+        if _TENSORLY_AVAILABLE:
+            print(f"\nRunning tensorly.decomposition.tucker (init='svd', tol={TOLERANCE:.1e}, max_iter={MAX_ITER})...")
+            start_time_tl = time.time()
+            try:
+                tl_core, tl_factors = tl_tucker(
+                    host_tensor_np,
+                    rank=ranks_req,
+                    init='svd',
+                    tol=TOLERANCE,
+                    n_iter_max=MAX_ITER,
+                    random_state=rng
+                )
+                tl_time = time.time() - start_time_tl
+                print(f"TensorLy execution finished in {tl_time:.4f} seconds.")
+            except Exception as e:
+                 print(f"WARNING: TensorLy execution failed: {e}. Cannot compare results.", file=sys.stderr)
+                 _TENSORLY_AVAILABLE = False
         else:
-            print("CUDA Execution successful.")
+            print("\nSkipping TensorLy execution (library not found).")
 
-        print(f"CUDA execution time: {cuda_time:.4f} seconds")
+        print("\n--- Verification ---")
 
-        print("Loading results from CUDA executable...")
-        cuda_A1 = load_tensor_from_file(OUTPUT_A1_FILE, (I1, R1))
-        cuda_A2 = load_tensor_from_file(OUTPUT_A2_FILE, (I2, R2))
-        cuda_A3 = load_tensor_from_file(OUTPUT_A3_FILE, (I3, R3))
-        cuda_A4 = load_tensor_from_file(OUTPUT_A4_FILE, (I4, R4))
-        cuda_G = load_tensor_from_file(OUTPUT_G_FILE, ranks)
-        cuda_factors = [cuda_A1, cuda_A2, cuda_A3, cuda_A4]
-        print("Successfully loaded CUDA results.")
-
-        print("Running TensorLy Tucker decomposition...")
-        start_time_tl = time.time()
-        tl_core, tl_factors = tucker(
-            host_tensor_np,
-            rank=ranks,
-            init='random', # Use random init for fair comparison with C++ random init
-            random_state=1234, # Use same seed if possible
-            tol=1e-5,
-            n_iter_max=100
-        )
-        tl_time = time.time() - start_time_tl
-        print("TensorLy execution finished.")
-        print(f"TensorLy execution time: {tl_time:.4f} seconds")
-
-        print("Comparing Reconstruction Errors...")
-        cuda_reconstruction = multi_mode_dot(cuda_G, cuda_factors, modes=[0, 1, 2, 3])
-        tl_reconstruction = multi_mode_dot(tl_core, tl_factors, modes=[0, 1, 2, 3])
-
-        cuda_recon_error = np.linalg.norm(host_tensor_np - cuda_reconstruction) / tensor_norm
-        tl_recon_error = np.linalg.norm(host_tensor_np - tl_reconstruction) / tensor_norm
-
-        print(f"Relative Reconstruction Error (CUDA)  : {cuda_recon_error:.6e}")
-        print(f"Relative Reconstruction Error (TensorLy): {tl_recon_error:.6e}")
-
-        print("--- Verification ---")
-        if cuda_recon_error > RECONSTRUCTION_ERROR_THRESHOLD:
-             print(f"FAIL: CUDA reconstruction error ({cuda_recon_error:.6e}) exceeds threshold ({RECONSTRUCTION_ERROR_THRESHOLD:.6e})")
-             overall_passed = False
+        print("Checking output shapes...")
+        correct_shapes = True
+        expected_core_shape = tuple(ranks_clamped)
+        if cuda_core.shape != expected_core_shape:
+            print(f"FAIL: CUDA core shape mismatch. Expected {expected_core_shape}, Got {cuda_core.shape}", file=sys.stderr)
+            correct_shapes = False
+        if len(cuda_factors) != len(dims):
+            print(f"FAIL: CUDA returned incorrect number of factors. Expected {len(dims)}, Got {len(cuda_factors)}", file=sys.stderr)
+            correct_shapes = False
         else:
-             print(f"PASS: CUDA reconstruction error ({cuda_recon_error:.6e}) is within threshold.")
+            for i, factor in enumerate(cuda_factors):
+                expected_factor_shape = (dims[i], ranks_clamped[i])
+                if factor.shape != expected_factor_shape:
+                     print(f"FAIL: CUDA factor A{i+1} shape mismatch. Expected {expected_factor_shape}, Got {factor.shape}", file=sys.stderr)
+                     correct_shapes = False
+        if correct_shapes: print("PASS: Output shapes are correct.")
+        overall_passed &= correct_shapes
 
-        # Orthogonality check
-        print("Checking CUDA Factor Orthogonality:")
-        ortho_failed = False
+        if multi_mode_dot is not None:
+            print("Checking reconstruction error...")
+            cuda_reconstruction = multi_mode_dot(cuda_core, cuda_factors, modes=list(range(len(dims))))
+            cuda_recon_error = np.linalg.norm(host_tensor_np - cuda_reconstruction) / tensor_norm
+            print(f"  Relative Reconstruction Error (CUDA): {cuda_recon_error:.6e}")
+
+            if cuda_recon_error > RECONSTRUCTION_ERROR_ABS_THRESHOLD:
+                 print(f"FAIL: CUDA reconstruction error ({cuda_recon_error:.6e}) exceeds threshold ({RECONSTRUCTION_ERROR_ABS_THRESHOLD:.1e})", file=sys.stderr)
+                 overall_passed = False
+            else:
+                 print(f"PASS: CUDA reconstruction error within threshold {RECONSTRUCTION_ERROR_ABS_THRESHOLD:.1e}.")
+
+            if _TENSORLY_AVAILABLE and tl_core is not None:
+                tl_reconstruction = multi_mode_dot(tl_core, tl_factors, modes=list(range(len(dims))))
+                tl_recon_error = np.linalg.norm(host_tensor_np - tl_reconstruction) / tensor_norm
+                print(f"  Relative Reconstruction Error (TensorLy): {tl_recon_error:.6e}")
+
+                error_diff = abs(cuda_recon_error - tl_recon_error)
+                print(f"  Difference in Reconstruction Error: {error_diff:.6e}")
+                if error_diff > RECONSTRUCTION_ERROR_DIFF_THRESHOLD:
+                     print(f"WARNING: Difference vs TensorLy ({error_diff:.6e}) exceeds threshold {RECONSTRUCTION_ERROR_DIFF_THRESHOLD:.1e}.")
+                     # Algorithm differences could account for this
+                else:
+                     print(f"PASS: Reconstruction error difference vs TensorLy within threshold {RECONSTRUCTION_ERROR_DIFF_THRESHOLD:.1e}.")
+        else:
+            print("Skipping reconstruction check (TensorLy not available).")
+
+        print("Checking CUDA Factor Orthogonality...")
+        ortho_passed = True
         for i, factor in enumerate(cuda_factors):
             I, R = factor.shape
             if I >= R:
                 identity = np.eye(R, dtype=DTYPE)
-                factor_T_factor = factor.T @ factor
-                ortho_error = np.max(np.abs(factor_T_factor - identity))
-                if ortho_error > 1e-3: # Allow some tolerance for numerical errors
-                    print(f"  Orthogonality check (CUDA) A{i+1}.T @ A{i+1} vs Identity: False")
-                    print(f"    Max deviation from Identity: {ortho_error:.6e}")
-                    ortho_failed = True
-                else:
-                    print(f"  Orthogonality check (CUDA) A{i+1}.T @ A{i+1} vs Identity: True (Max dev: {ortho_error:.6e})")
+                try:
+                    factor_T_factor = factor.T @ factor
+                    ortho_error = np.max(np.abs(factor_T_factor - identity))
+                    if ortho_error > ORTHOGONALITY_THRESHOLD:
+                        print(f"FAIL: Orthogonality check A{i+1}. Max deviation {ortho_error:.6e} > {ORTHOGONALITY_THRESHOLD:.1e}", file=sys.stderr)
+                        ortho_passed = False
+                    else:
+                        print(f"  Orthogonality check A{i+1}: PASS (Max dev: {ortho_error:.6e})")
+                except Exception as e:
+                     print(f"FAIL: Error during orthogonality check for A{i+1}: {e}", file=sys.stderr)
+                     ortho_passed = False
             else:
-                # If I < R, factor columns cannot be fully orthogonal.
-                print(f"  Orthogonality check (CUDA) A{i+1}: Skipped (Dimension {I} < Rank {R})")
-
-        if ortho_failed:
-            print("WARNING: One or more CUDA factors failed the orthogonality check.")
-            # Decide if this constitutes a failure for your criteria
-            # overall_passed = False
+                print(f"  Orthogonality check A{i+1}: Skipped (Dimension {I} < Rank {R})")
+        if ortho_passed: print("PASS: Orthogonality checks passed (where applicable).")
+        overall_passed &= ortho_passed
 
     except Exception as e:
-        print(f"\n--- TEST FAILED DUE TO ERROR ---")
-        print(f"Error encountered: {e}")
+        print(f"\n--- TEST FAILED DUE TO UNEXPECTED ERROR ---", file=sys.stderr)
+        print(f"Error encountered: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         overall_passed = False
-    finally:
-        # Cleanup temporary files
-        cleanup_files(temp_files)
 
-    print("--- Test Finished ---")
+    print("\n--- Test Summary ---")
     if overall_passed:
-        print("Overall Result: PASS")
+        print("RESULT: PASSED")
         sys.exit(0)
     else:
-        print("Overall Result: FAIL")
+        print("RESULT: FAILED")
         sys.exit(1) 

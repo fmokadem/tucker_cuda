@@ -9,6 +9,7 @@
 #include <cassert>
 #include <iomanip>      // For printing progress
 #include <algorithm>    // For std::max_element, std::min
+#include <limits>       // For numeric_limits
 
 // CUDA includes
 #include <cuda_runtime.h>
@@ -16,10 +17,10 @@
 #include <cusolverDn.h>
 
 // Use the consistent data type from host_logic.h
-// using real = float;
+using real = float;
 
-// --- CUDA Error Checking Macros --- //
-// Redefine error checking macros locally for robustness.
+// --- CUDA Error Checking Macros ---
+// Throw runtime_error on CUDA API errors.
 #ifndef CHECK_CUDA
 #define CHECK_CUDA(call)                                                        \
     do {                                                                        \
@@ -31,7 +32,7 @@
         }                                                                       \
     } while (0)
 #endif
-
+// Throw runtime_error on cuBLAS API errors.
 #ifndef CHECK_CUBLAS
 #define CHECK_CUBLAS(call)                                                      \
     do {                                                                        \
@@ -46,7 +47,7 @@
         }                                                                       \
     } while (0)
 #endif
-
+// Throw runtime_error on cuSOLVER API errors.
 #ifndef CHECK_CUSOLVER
 #define CHECK_CUSOLVER(call)                                                    \
     do {                                                                        \
@@ -73,26 +74,279 @@ long long product(const std::vector<int>& dims) {
     return p;
 }
 
-// --- SVD-based Factor Initialization (Placeholder/Stub) ---
-// NOTE: The current implementation is a non-functional stub.
-//       Factor initialization relies on the data provided in h_A from the caller.
-void initialize_factors_svd(
+// --- HOSVD-based Factor Initialization ---
+// Replaces the previous stub implementation.
+void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosvd' to match existing stub name
+    const real* d_X,                  // Input tensor (GPU)
+    const std::vector<int>& X_dims,   // Input tensor dimensions {I0, I1, I2, I3}
+    const std::vector<int>& R_dims,   // Target ranks (clamped) {R0, R1, R2, R3}
+    std::vector<real*>& d_A,          // Output Factor matrices (GPU pointers) {d_A0, d_A1, d_A2, d_A3}
     cusolverDnHandle_t cusolverH,
     cublasHandle_t cublasH,
-    cudaStream_t stream,
-    real* d_X,
-    const std::vector<int>& X_dims,
-    std::vector<real*>& d_A,
-    const std::vector<int>& R_dims_clamped,
-    int num_modes,
-    real* d_temp_unfold, size_t max_unfold_bytes,
-    real* d_temp_VT, size_t max_VT_bytes,
-    real* d_temp_S, size_t max_S_bytes,
-    real* d_svd_work, int lwork,
-    int* d_svd_info)
-{
-    std::cerr << "WARNING: initialize_factors_svd() is a STUB and does not perform SVD initialization!" << std::endl;
-    std::cout << "         Factors initialized using data provided from host (h_A)." << std::endl;
+    cudaStream_t stream
+) {
+    std::cout << "--- Starting HOSVD Initialization ---" << std::endl;
+    const int num_modes = X_dims.size(); // Should be 4 based on caller checks
+
+    if (num_modes != 4 || R_dims.size() != num_modes || d_A.size() != num_modes) {
+         throw std::runtime_error("HOSVD requires 4D tensors, 4 ranks, and 4 factor matrix pointers.");
+    }
+
+    // --- 1. Determine Max Buffer Sizes ---
+    long long max_unfold_rows = 0;
+    long long max_unfold_cols = 0;
+    long long max_unfold_elements = 0;
+    int max_svd_m = 0; // Max 'm' dimension fed to SVD (rows of input to SVD)
+    int max_svd_n = 0; // Max 'n' dimension fed to SVD (cols of input to SVD)
+    int max_S_elements = 0; // Max size of singular value vector
+
+    for (int n = 0; n < num_modes; ++n) {
+        long long unfold_rows_n = X_dims[n]; // I_n
+        long long unfold_cols_n = 1;
+        for (int m = 0; m < num_modes; ++m) {
+            if (m != n) {
+                if (X_dims[m] == 0) { unfold_cols_n = 0; break; } // Avoid overflow if dim is 0
+                unfold_cols_n *= X_dims[m];
+            }
+        }
+
+        max_unfold_rows = std::max(max_unfold_rows, unfold_rows_n);
+        max_unfold_cols = std::max(max_unfold_cols, unfold_cols_n);
+        max_unfold_elements = std::max(max_unfold_elements, unfold_rows_n * unfold_cols_n);
+
+        // Dimensions for SVD (computing SVD(X_(n)^T))
+        // Input to SVD is treated as column-major: (Product Others) x I_n
+        int svd_m_n = static_cast<int>(unfold_cols_n); // Rows for SVD = original columns
+        int svd_n_n = static_cast<int>(unfold_rows_n); // Cols for SVD = original rows (I_n)
+        max_svd_m = std::max(max_svd_m, svd_m_n);
+        max_svd_n = std::max(max_svd_n, svd_n_n);
+        max_S_elements = std::max(max_S_elements, std::min(svd_m_n, svd_n_n));
+    }
+
+    if (max_unfold_elements == 0) {
+         std::cout << "Input tensor is empty, skipping HOSVD." << std::endl;
+         // Factors d_A should already be allocated (possibly zero-size) by caller.
+         return;
+    }
+
+
+    // --- 2. Allocate Temporary GPU Buffers ---
+    real* d_X_unfold = nullptr;
+    real* d_S = nullptr;
+    real* d_VT = nullptr;
+    int* d_info = nullptr;
+    real* d_svd_work = nullptr;
+    int lwork = 0;
+    real* d_dummy_B = nullptr; // Allocate a dummy buffer for cublasSgeam
+    real* d_Tmp_ColMajor = nullptr; // Intermediate buffer for transpose
+
+    try {
+        CHECK_CUDA(cudaMalloc(&d_X_unfold, max_unfold_elements * sizeof(real)));
+        CHECK_CUDA(cudaMalloc(&d_S, max_S_elements * sizeof(real)));
+
+        // VT size: min(m, n) x n = max_S_elements x max_svd_n
+        size_t VT_elements = (size_t)max_S_elements * max_svd_n;
+        CHECK_CUDA(cudaMalloc(&d_VT, VT_elements * sizeof(real)));
+        CHECK_CUDA(cudaMalloc(&d_info, sizeof(int)));
+
+        // Allocate workspace for SVD
+        CHECK_CUSOLVER(cusolverDnSgesvd_bufferSize(cusolverH, max_svd_m, max_svd_n, &lwork));
+        if (lwork < 0) { // Check for potential negative lwork
+            throw std::runtime_error("cusolverDnSgesvd_bufferSize returned negative lwork: " + std::to_string(lwork));
+        }
+        CHECK_CUDA(cudaMalloc(&d_svd_work, (size_t)lwork * sizeof(real)));
+
+        // Allocate dummy buffer (size based on max In * Rn)
+        int max_In = 0; // Avoid potential issue if X_dims is empty
+        if (!X_dims.empty()) max_In = *std::max_element(X_dims.begin(), X_dims.end());
+        int max_Rn = 0;
+        if (!R_dims.empty()) max_Rn = *std::max_element(R_dims.begin(), R_dims.end());
+
+        if (max_In > 0 && max_Rn > 0) {
+             CHECK_CUDA(cudaMalloc(&d_dummy_B, (size_t)max_In * max_Rn * sizeof(real)));
+             // Allocate temp buffer for col-major In x Rn matrix
+             CHECK_CUDA(cudaMalloc(&d_Tmp_ColMajor, (size_t)max_In * max_Rn * sizeof(real)));
+        }
+
+    } catch (...) {
+        // Cleanup partially allocated buffers on error
+        if(d_Tmp_ColMajor) CHECK_CUDA(cudaFree(d_Tmp_ColMajor));
+        if(d_dummy_B) CHECK_CUDA(cudaFree(d_dummy_B));
+        if(d_svd_work) CHECK_CUDA(cudaFree(d_svd_work));
+        if(d_info) CHECK_CUDA(cudaFree(d_info));
+        if(d_VT) CHECK_CUDA(cudaFree(d_VT));
+        if(d_S) CHECK_CUDA(cudaFree(d_S));
+        if(d_X_unfold) CHECK_CUDA(cudaFree(d_X_unfold));
+        std::cerr << "Error during HOSVD temporary buffer allocation." << std::endl;
+        throw; // Re-throw the exception
+    }
+
+
+    // --- 3. Loop Through Modes ---
+    for (int n = 0; n < num_modes; ++n) {
+        std::cout << "Initializing factor for mode " << n << "..." << std::endl;
+
+        long long current_unfold_rows = X_dims[n]; // I_n
+        long long current_unfold_cols = 1;
+         for (int m = 0; m < num_modes; ++m) {
+            if (m != n) {
+                 if (X_dims[m] == 0) { current_unfold_cols = 0; break; }
+                 current_unfold_cols *= X_dims[m];
+             }
+        }
+        long long current_unfold_elements = current_unfold_rows * current_unfold_cols;
+
+        if (current_unfold_elements == 0 || R_dims[n] == 0) {
+            std::cout << "  Skipping mode " << n << " due to zero dimension or rank." << std::endl;
+            // No need to initialize d_A[n], caller ensures it's allocated (possibly zero size)
+            continue;
+        }
+
+
+        // --- a. Unfold X along mode n ---
+        std::cout << "  Unfolding tensor (mode " << n << ") -> (" << current_unfold_rows << " x " << current_unfold_cols << ")..." << std::endl;
+        // Assuming launch_MatricizeKernel unfolds into row-major d_X_unfold[I_n][Others]
+        launch_MatricizeKernel(d_X, d_X_unfold, X_dims, n, stream);
+        CHECK_CUDA(cudaGetLastError()); // Check kernel launch
+        CHECK_CUDA(cudaDeviceSynchronize()); // Ensure kernel completes before SVD
+
+
+        // --- b. Prepare for SVD ---
+        // We compute SVD of X_(n)^T, where X_(n) is the matrix in d_X_unfold (I_n x Others, row-major).
+        // When read by cuSOLVER as column-major, X_(n)^T is (Others x I_n).
+        int svd_m = static_cast<int>(current_unfold_cols); // Rows for SVD = Others
+        int svd_n_dim = static_cast<int>(current_unfold_rows); // Cols for SVD = I_n
+        // Leading dimension of the matrix as interpreted by cuSOLVER (col-major):
+        // Since input d_X_unfold is row-major I_n x Others, reading as col-major Others x I_n means ld = Others = svd_m
+        int svd_lda = svd_m; // LDA for the input matrix X_(n)^T
+
+        // SVD computes: A = U' * S * VT' (where A = X_(n)^T)
+        // We want the first R_n columns of the left singular vectors of X_(n). Let X_(n) = U * S * V^T.
+        // We compute SVD of A = X_(n)^T = (U*S*V^T)^T = V*S*U^T.
+        // So, A = U'*S*VT' => U' = V and VT' = U^T.
+        // The left singular vectors U of X_(n) are the rows of VT' = U^T.
+        // We need VT' from cusolver, which computes A = U' S (V')^T.
+        // So we need VT = (V')^T from cuSOLVER. Wait, the pseudocode was correct.
+        // A = X_(n)^T. SVD(A) = U' S (V')^T.
+        // We want the first R_n columns of U from SVD(X_(n)).
+        // X_(n) = U S V^T.
+        // A = X_(n)^T = V S U^T.
+        // Comparing A = U' S (V')^T with A = V S U^T, we have U' = V and (V')^T = U^T.
+        // So the desired U is V'. We need the columns of V'.
+        // cuSolver computes SVD of A (our X_(n)^T) and gives us `VT = (V')^T`.
+        // The columns of V' are the rows of VT.
+        // So we need the first R_n rows of VT computed by cuSolver.
+
+        signed char jobu = 'N';  // Don't compute U' (which is V)
+        signed char jobvt = 'S'; // Compute first min(m, n) rows of VT = (V')^T = U^T. These rows contain the vectors we need.
+                                 // The rows of U^T are the columns of U. Correct.
+
+        std::cout << "  Computing SVD (" << svd_m << " x " << svd_n_dim << ")..." << std::endl;
+        CHECK_CUSOLVER(cusolverDnSgesvd(
+            cusolverH,
+            jobu,       // Don't compute U'
+            jobvt,      // Compute first min(m,n) rows of VT = U^T
+            svd_m,      // Rows of A = X_(n)^T = Others
+            svd_n_dim,  // Cols of A = X_(n)^T = I_n
+            d_X_unfold, // Input matrix A = X_(n)^T (interpreted col-major)
+            svd_lda,    // Leading Dim = svd_m = Others
+            d_S,        // Output Singular values
+            nullptr,    // Placeholder for U' (not computed)
+            svd_m,      // LDU placeholder
+            d_VT,       // Output VT = U^T. Size min(m,n) x n_dim = min(Others, I_n) x I_n
+            svd_n_dim,  // Leading Dimension of VT = I_n
+            d_svd_work, // Workspace
+            lwork,      // Workspace size
+            nullptr,    // rwork (deprecated)
+            d_info      // Convergence info
+        ));
+         CHECK_CUDA(cudaDeviceSynchronize()); // Ensure SVD completes
+
+
+        // --- c. Check SVD Convergence ---
+        int info_host = -1; // Initialize to invalid
+        CHECK_CUDA(cudaMemcpy(&info_host, d_info, sizeof(int), cudaMemcpyDeviceToHost));
+        if (info_host < 0) {
+             std::string msg = "HOSVD Error: cusolverDnSgesvd argument " + std::to_string(-info_host) + " was illegal for mode " + std::to_string(n) + ".";
+             std::cerr << msg << std::endl;
+             throw std::runtime_error(msg);
+        } else if (info_host > 0) {
+             // Non-convergence might not be fatal for initialization, print warning.
+             std::cerr << "HOSVD Warning: cusolverDnSgesvd did not converge for mode " << n << ". " << info_host << " superdiagonals failed to converge." << std::endl;
+             // Continue, the computed factors might still be usable.
+        }
+
+
+        // --- d. Extract Factor A^(n) --- Step 1: Transpose VT submatrix -> Temp ColMajor --- 
+        std::cout << "  Extracting factor A[" << n << "] (size " << X_dims[n] << " x " << R_dims[n] << ")... Step 1/2" << std::endl;
+        int Rn = R_dims[n]; // Target rank for this mode
+        int In = X_dims[n]; // Dimension for this mode
+
+        // First transpose: VT[0:Rn-1, 0:In-1] (Rn x In, ld=In) -> d_Tmp_ColMajor (In x Rn, ld=In)
+        // C = alpha * op(A) + beta * op(B)
+        // C = d_Tmp_ColMajor (m=In, n=Rn, ldc=In)
+        // A = d_VT (first Rn rows) (conceptual Rn x In, lda=In)
+        // op(A) = transpose(A) (In x Rn)
+        // B = d_dummy_B (m=In, n=Rn, ldb=In)
+        // op(B) = no-op(B)
+        const real alpha = 1.0f;
+        const real beta = 0.0f;
+        CHECK_CUBLAS(cublasSgeam(cublasH,
+                                 CUBLAS_OP_T,    // Transpose Source (VT submatrix)
+                                 CUBLAS_OP_N,    // No-Op on Dummy B
+                                 In,             // m: Rows of op(A) and C = In
+                                 Rn,             // n: Cols of op(A) and C = Rn
+                                 &alpha,
+                                 d_VT,           // A: Source matrix (VT)
+                                 svd_n_dim,      // lda: Leading dim of source d_VT = In
+                                 &beta,
+                                 d_dummy_B,      // B: Dummy matrix B pointer
+                                 In,             // ldb: Use m=In
+                                 d_Tmp_ColMajor, // C: Destination is Temp buffer
+                                 In              // ldc: Leading dim of C (>= m=In), use In for ColMajor
+                                ));
+        CHECK_CUDA(cudaDeviceSynchronize()); // Sync after first transpose
+
+        // --- d. Extract Factor A^(n) --- Step 2: Transpose Temp ColMajor -> Final RowMajor d_A[n] ---
+        std::cout << "  Extracting factor A[" << n << "] ... Step 2/2" << std::endl;
+        // Second transpose: d_Tmp_ColMajor (In x Rn, ld=In) -> d_A[n] (In x Rn, ld=Rn)
+        // C = alpha * op(A) + beta * op(B)
+        // C = d_A[n] (m=Rn, n=In, ldc=Rn)
+        // A = d_Tmp_ColMajor (In x Rn, lda=In)
+        // op(A) = transpose(A) (Rn x In)
+        // B = d_dummy_B (m=Rn, n=In, ldb=Rn)
+        // op(B) = no-op(B)
+        CHECK_CUBLAS(cublasSgeam(cublasH,
+                                 CUBLAS_OP_T,    // Transpose Source (Temp buffer)
+                                 CUBLAS_OP_N,    // No-Op on Dummy B
+                                 Rn,             // m: Rows of op(A) and C = Rn
+                                 In,             // n: Cols of op(A) and C = In
+                                 &alpha,
+                                 d_Tmp_ColMajor, // A: Source is Temp buffer
+                                 In,             // lda: Leading dim of source = In
+                                 &beta,
+                                 d_dummy_B,      // B: Dummy matrix B pointer
+                                 Rn,             // ldb: Use m=Rn
+                                 d_A[n],         // C: Destination is final d_A[n]
+                                 Rn              // ldc: Leading dim of C (>=m=Rn), use Rn for RowMajor
+                                ));
+        CHECK_CUDA(cudaDeviceSynchronize()); // Sync after second transpose
+
+        std::cout << "  Factor A[" << n << "] initialized." << std::endl;
+
+    } // End For loop n
+
+    // --- 4. Cleanup Temporary Buffers ---
+    std::cout << "Cleaning up temporary HOSVD buffers..." << std::endl;
+    if (d_Tmp_ColMajor) CHECK_CUDA(cudaFree(d_Tmp_ColMajor)); // Free temp transpose buffer
+    if (d_dummy_B) CHECK_CUDA(cudaFree(d_dummy_B));
+    CHECK_CUDA(cudaFree(d_svd_work));
+    CHECK_CUDA(cudaFree(d_info));
+    CHECK_CUDA(cudaFree(d_VT));
+    CHECK_CUDA(cudaFree(d_S));
+    CHECK_CUDA(cudaFree(d_X_unfold));
+
+    std::cout << "--- HOSVD Initialization Complete ---" << std::endl;
 }
 
 // --- Main Host Logic for CUDA-accelerated Tucker Decomposition (HOOI) ---
@@ -106,7 +360,30 @@ void tucker_hooi_cuda(
     int max_iterations
     )
 {
-    if (!(X_dims.size() == 4 && R_dims_in.size() == 4 && h_A.size() == 4)) {
+    // ========================================================================
+    // ALERT / TODO: Potential Issues in HOOI Algorithm Implementation
+    // ------------------------------------------------------------------------
+    // Testing (e.g., via test_tucker_cuda.py) indicates that the current
+    // implementation produces results with:
+    //   1. High Relative Reconstruction Error: The computed core and factors
+    //      do not accurately reconstruct the original tensor.
+    //   2. Lack of Factor Orthogonality: The computed factor matrices (A_n)
+    //      are not sufficiently orthogonal (||A_n^T * A_n - I|| is large).
+    //
+    // This suggests potential problems within the main HOOI iteration loop below,
+    // specifically concerning:
+    //   - How the SVD results are extracted and used to update factors.
+    //   - The tensor projection steps (n-mode product kernel calls).
+    //   - The calculation of the convergence metric (`delta`).
+    //   - General numerical stability or correctness of the iterative updates.
+    //
+    // The HOSVD initialization (`initialize_factors_svd`) appears to run,
+    // but the subsequent iterative refinement fails to converge to an accurate
+    // and orthogonal solution within the specified iterations/tolerance.
+    // Further debugging and verification of the HOOI steps are required.
+    // ========================================================================
+
+    if (!(X_dims.size() == 4 && R_dims_in.size() == 4)) {
          throw std::invalid_argument("Tucker HOOI requires 4D tensors, 4 ranks, and 4 factor matrix slots.");
     }
 
@@ -233,7 +510,7 @@ void tucker_hooi_cuda(
         }
 
         if (max_proj_bytes > 0) {
-             CHECK_CUDA(cudaMalloc(&d_Y_projected1, max_proj_bytes));
+            CHECK_CUDA(cudaMalloc(&d_Y_projected1, max_proj_bytes));
              CHECK_CUDA(cudaMalloc(&d_Y_projected2, max_proj_bytes));
         }
         if (max_unfold_bytes > 0) CHECK_CUDA(cudaMalloc(&d_Y_unfolded, max_unfold_bytes));
@@ -257,14 +534,29 @@ void tucker_hooi_cuda(
         CHECK_CUDA(cudaMemcpyAsync(d_X, h_X.data(), X_bytes, cudaMemcpyHostToDevice, stream));
         for (int n = 0; n < num_modes; ++n) {
             if(A_sizes_bytes[n] > 0) {
-                CHECK_CUDA(cudaMemcpyAsync(d_A[n], h_A[n].data(), A_sizes_bytes[n], cudaMemcpyHostToDevice, stream));
+                 CHECK_CUDA(cudaMemcpyAsync(d_A[n], h_A[n].data(), A_sizes_bytes[n], cudaMemcpyHostToDevice, stream));
             }
         }
         CHECK_CUDA(cudaStreamSynchronize(stream));
         std::cout << "Input data copied to GPU." << std::endl;
 
-        // --- 4. SVD Initialization (Placeholder) --- //
-        // initialize_factors_svd(...); // Currently relies on user-provided h_A
+        // --- 4. Initialize Factors using HOSVD --- //
+        try {
+             initialize_factors_svd(d_X, X_dims, R_dims, d_A, cusolverH, cublasH, stream); // Use clamped R_dims
+             // Initialize d_A_prev with the results from HOSVD
+             std::cout << "Copying initial factors to d_A_prev..." << std::endl;
+             for(int n=0; n<num_modes; ++n) {
+                 if (d_A[n] != nullptr && d_A_prev[n] != nullptr) { // Check for null pointers if size is 0
+                     size_t A_bytes = (size_t)X_dims[n] * R_dims[n] * sizeof(real);
+                     CHECK_CUDA(cudaMemcpy(d_A_prev[n], d_A[n], A_bytes, cudaMemcpyDeviceToDevice));
+                 }
+             }
+              CHECK_CUDA(cudaDeviceSynchronize()); // Sync after init and copy
+        } catch (...) {
+             // ... (add full cleanup from allocation block) ...
+             std::cerr << "Error during HOSVD initialization." << std::endl;
+             throw;
+        }
 
         // --- 5. HOOI Iteration --- //
         std::cout << "Starting HOOI iterations..." << std::endl;
@@ -485,7 +777,7 @@ void tucker_hooi_cuda(
 
         // --- 8. Copy Results Back to Host --- //
         std::cout << "Copying results back to host..." << std::endl;
-        if (G_size > 0) CHECK_CUDA(cudaMemcpyAsync(h_G.data(), d_G, G_bytes, cudaMemcpyDeviceToHost, stream));
+        if (G_size > 0) CHECK_CUDA(cudaMemcpyAsync(h_G.data(), d_G, G_size * sizeof(real), cudaMemcpyDeviceToHost, stream));
         for (int n = 0; n < num_modes; ++n) {
             if(A_sizes_bytes[n] > 0) {
                 CHECK_CUDA(cudaMemcpyAsync(h_A[n].data(), d_A[n], A_sizes_bytes[n], cudaMemcpyDeviceToHost, stream));

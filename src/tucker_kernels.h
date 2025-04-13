@@ -6,9 +6,7 @@
 #include <cstdio>
 #include <cstdlib> // For exit
 
-// --- CUDA Error Checking Macro ---
-// Provides a simple way to check for CUDA API errors after calls.
-// Terminates the program on error. Consider using exceptions for library code.
+// CUDA Error Checking
 #ifndef CHECK_CUDA
 #define CHECK_CUDA(call) { \
     cudaError_t err = call; \
@@ -20,7 +18,7 @@
 #endif
 
 /**
- * @brief Launches CUDA kernel for n-Mode Product: Y = T x_n A or Y = T x_n A^T.
+ * @brief Launches n-Mode Product kernel: Y = T x_n A or Y = T x_n A^T.
  */
 void launch_nModeProductKernel(
     const float* d_input_tensor,
@@ -35,7 +33,7 @@ void launch_nModeProductKernel(
 );
 
 /**
- * @brief Launches CUDA kernel for Matricization (Unfolding): M = T_(n).
+ * @brief Launches Matricization (Unfolding) kernel: M = T_(n).
  */
 void launch_MatricizeKernel(
     const float* d_input_tensor,
@@ -46,14 +44,15 @@ void launch_MatricizeKernel(
 );
 
 /**
- * @brief Launches CUDA kernel to copy first columns: Dest[:, 0:N] = Src[:, 0:N].
+ * @brief Launches kernel to copy first N columns: Dest[:, 0:N-1] = Src[:, 0:N-1].
  */
 void launch_CopyColumnsKernel(
     float* d_dest_matrix,
     const float* d_src_matrix,
     int num_rows,
-    int num_cols_to_copy,
-    int src_cols,
+    int num_cols_to_copy, // N
+    int src_leading_dim,  // Leading dimension of Src
+    int dest_leading_dim, // Leading dimension of Dest
     cudaStream_t stream
 );
 

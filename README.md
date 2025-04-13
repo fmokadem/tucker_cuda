@@ -169,10 +169,21 @@ See `examples/example_usage.py`.
 ### 2. Standalone Executable (`tucker_app`)
 
 Located at `build/tucker_app`.
-Usage (from build dir): `./tucker_app <in.bin> <A1.bin> ... <G.bin> <I1> ... <R4> [tol] [max_iter]`
-Requires input tensor and outputs factors/core as raw binary files.
+generates a random tensor based on command-line dimensions (`<max_iter> <tolerance> <I1> <I2> <I3> <I4>`), runs the decomposition, and prints a summary.
+
+**Usage:**
+
+```bash
+./build/tucker_app <max_iterations> <tolerance> <I1> <I2> <I3> <I4>
+```
+
+**Example:**
+```bash
+./build/tucker_app 100 1e-6 20 22 24 26
+```
+
 
 ## Testing
 
 -   `examples/example_usage.py`: Basic Python usage.
--   `examples/test_tucker_cuda.py`: Compares `build/tucker_app` output against TensorLy via file I/O (requires TensorLy). 
+-   `examples/test_tucker_cuda.py`: Compares the Python binding `tuckercuda.hooi` against TensorLy (requires TensorLy). 
