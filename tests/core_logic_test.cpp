@@ -16,6 +16,13 @@
 #include <cublas_v2.h>
 #include <cusolverDn.h>
 
+// Forward declaration for the internal HOSVD init function
+void initialize_factors_svd(
+    const real* d_X, const std::vector<int>& X_dims, const std::vector<int>& R_dims,
+    std::vector<real*>& d_A, cusolverDnHandle_t cusolverH, cublasHandle_t cublasH,
+    cudaStream_t stream
+);
+
 // --- Add necessary error checking macros ---
 // (Copy definitions from host_logic.cpp or include a common header if one exists)
 #ifndef CHECK_CUDA
@@ -304,10 +311,10 @@ int main() {
 
 
             // --- Test HOSVD Initialization Orthogonality ---
-            /*
             std::cout << "    Running HOSVD init..." << std::flush;
             CHECK_CUDA(cudaMemcpy(d_X, h_X.data(), X_size * sizeof(real), cudaMemcpyHostToDevice));
-            tucker_hooi_cuda(h_X, X_dims, h_A_hooi, h_G_hooi, R_dims_in, 1e-6f, 100);
+            // We need to call the internal HOSVD function directly here
+            initialize_factors_svd(d_X, X_dims, R_dims_clamped, d_A, cusolverH, cublasH, stream); // Call HOSVD init
             std::cout << " done." << std::endl;
 
             hosvd_ortho_err = 0.0;
@@ -323,8 +330,8 @@ int main() {
                         check_orthogonality(h_A_hosvd[n], X_dims[n], R_dims_clamped[n]));
                 }
             }
-             std::cout << "    HOSVD Ortho Error (Max): " << hosvd_ortho_err << std::endl;
-            */
+            std::cout << "    HOSVD Ortho Error (Max): " << hosvd_ortho_err << std::endl;
+
             // --- Test HOOI ---
              std::cout << "    Running HOOI..." << std::flush;
              // Prepare host outputs for HOOI function

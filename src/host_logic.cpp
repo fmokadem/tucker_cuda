@@ -85,7 +85,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
     cublasHandle_t cublasH,
     cudaStream_t stream
 ) {
-    std::cout << "--- Starting HOSVD Initialization ---" << std::endl;
+    //printf("--- Starting HOSVD Initialization ---\n"); // Commented out
     const int num_modes = X_dims.size(); // Should be 4 based on caller checks
 
     if (num_modes != 4 || R_dims.size() != num_modes || d_A.size() != num_modes) {
@@ -124,7 +124,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
     }
 
     if (max_unfold_elements == 0) {
-         std::cout << "Input tensor is empty, skipping HOSVD." << std::endl;
+         //printf("Input tensor is empty, skipping HOSVD.\n"); // Commented out
          // Factors d_A should already be allocated (possibly zero-size) by caller.
          return;
     }
@@ -177,14 +177,14 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         if(d_VT) CHECK_CUDA(cudaFree(d_VT));
         if(d_S) CHECK_CUDA(cudaFree(d_S));
         if(d_X_unfold) CHECK_CUDA(cudaFree(d_X_unfold));
-        std::cerr << "Error during HOSVD temporary buffer allocation." << std::endl;
+        //printf("Error during HOSVD temporary buffer allocation.\n"); // Commented out
         throw; // Re-throw the exception
     }
 
 
     // --- 3. Loop Through Modes ---
     for (int n = 0; n < num_modes; ++n) {
-        std::cout << "Initializing factor for mode " << n << "..." << std::endl;
+        //printf("Initializing factor for mode %d...\n", n); // Commented out
 
         long long current_unfold_rows = X_dims[n]; // I_n
         long long current_unfold_cols = 1;
@@ -197,14 +197,14 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         long long current_unfold_elements = current_unfold_rows * current_unfold_cols;
 
         if (current_unfold_elements == 0 || R_dims[n] == 0) {
-            std::cout << "  Skipping mode " << n << " due to zero dimension or rank." << std::endl;
+            //printf("  Skipping mode %d due to zero dimension or rank.\n", n); // Commented out
             // No need to initialize d_A[n], caller ensures it's allocated (possibly zero size)
             continue;
         }
 
 
         // --- a. Unfold X along mode n ---
-        std::cout << "  Unfolding tensor (mode " << n << ") -> (" << current_unfold_rows << " x " << current_unfold_cols << ")..." << std::endl;
+        //printf("  Unfolding tensor (mode %d) -> (%lld x %lld)...\n", n, current_unfold_rows, current_unfold_cols); // Commented out
         // Assuming launch_MatricizeKernel unfolds into row-major d_X_unfold[I_n][Others]
         launch_MatricizeKernel(d_X, d_X_unfold, X_dims, n, stream);
         CHECK_CUDA(cudaGetLastError()); // Check kernel launch
@@ -241,7 +241,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         signed char jobvt = 'S'; // Compute first min(m, n) rows of VT = (V')^T = U^T. These rows contain the vectors we need.
                                  // The rows of U^T are the columns of U. Correct.
 
-        std::cout << "  Computing SVD (" << svd_m << " x " << svd_n_dim << ")..." << std::endl;
+        //printf("  Computing SVD (%d x %d)...\n", svd_m, svd_n_dim); // Commented out
         CHECK_CUSOLVER(cusolverDnSgesvd(
             cusolverH,
             jobu,       // Don't compute U'
@@ -268,17 +268,17 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         CHECK_CUDA(cudaMemcpy(&info_host, d_info, sizeof(int), cudaMemcpyDeviceToHost));
         if (info_host < 0) {
              std::string msg = "HOSVD Error: cusolverDnSgesvd argument " + std::to_string(-info_host) + " was illegal for mode " + std::to_string(n) + ".";
-             std::cerr << msg << std::endl;
+             //printf("HOSVD Error: %s\n", msg.c_str()); // Commented out
              throw std::runtime_error(msg);
         } else if (info_host > 0) {
              // Non-convergence might not be fatal for initialization, print warning.
-             std::cerr << "HOSVD Warning: cusolverDnSgesvd did not converge for mode " << n << ". " << info_host << " superdiagonals failed to converge." << std::endl;
+             //printf("HOSVD Warning: cusolverDnSgesvd did not converge for mode %d. %d superdiagonals failed to converge.\n", n, info_host); // Commented out
              // Continue, the computed factors might still be usable.
         }
 
 
         // --- d. Extract Factor A^(n) --- Step 1: Transpose VT submatrix -> Temp ColMajor --- 
-        std::cout << "  Extracting factor A[" << n << "] (size " << X_dims[n] << " x " << R_dims[n] << ")... Step 1/2" << std::endl;
+        //printf("  Extracting factor A[%d] (size %d x %d)... Step 1/2\n", n, In, Rn); // Commented out
         int Rn = R_dims[n]; // Target rank for this mode
         int In = X_dims[n]; // Dimension for this mode
 
@@ -308,7 +308,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         CHECK_CUDA(cudaDeviceSynchronize()); // Sync after first transpose
 
         // --- d. Extract Factor A^(n) --- Step 2: Transpose Temp ColMajor -> Final RowMajor d_A[n] ---
-        std::cout << "  Extracting factor A[" << n << "] ... Step 2/2" << std::endl;
+        //printf("  Extracting factor A[%d] ... Step 2/2\n", n); // Commented out
         // Second transpose: d_Tmp_ColMajor (In x Rn, ld=In) -> d_A[n] (In x Rn, ld=Rn)
         // C = alpha * op(A) + beta * op(B)
         // C = d_A[n] (m=Rn, n=In, ldc=Rn)
@@ -332,12 +332,12 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
                                 ));
         CHECK_CUDA(cudaDeviceSynchronize()); // Sync after second transpose
 
-        std::cout << "  Factor A[" << n << "] initialized." << std::endl;
+        //printf("  Factor A[%d] initialized.\n", n); // Commented out
 
     } // End For loop n
 
     // --- 4. Cleanup Temporary Buffers ---
-    std::cout << "Cleaning up temporary HOSVD buffers..." << std::endl;
+    //printf("Cleaning up temporary HOSVD buffers...\n"); // Commented out
     if (d_Tmp_ColMajor) CHECK_CUDA(cudaFree(d_Tmp_ColMajor)); // Free temp transpose buffer
     if (d_dummy_B) CHECK_CUDA(cudaFree(d_dummy_B));
     CHECK_CUDA(cudaFree(d_svd_work));
@@ -346,7 +346,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
     CHECK_CUDA(cudaFree(d_S));
     CHECK_CUDA(cudaFree(d_X_unfold));
 
-    std::cout << "--- HOSVD Initialization Complete ---" << std::endl;
+    //printf("--- HOSVD Initialization Complete ---\n"); // Commented out
 }
 
 // --- Main Host Logic for CUDA-accelerated Tucker Decomposition (HOOI) ---
@@ -400,7 +400,7 @@ void tucker_hooi_cuda(
         }
         R_dims[n] = std::min(R_dims[n], X_dims[n]);
     }
-    std::cout << "Using clamped ranks: [" << R_dims[0] << ", " << R_dims[1] << ", " << R_dims[2] << ", " << R_dims[3] << "]" << std::endl;
+    //printf("Using clamped ranks: [%d, %d, %d, %d]\n", R_dims[0], R_dims[1], R_dims[2], R_dims[3]); // Commented out
 
     long long X_size = product(X_dims);
     long long G_size = product(R_dims);
@@ -527,10 +527,10 @@ void tucker_hooi_cuda(
             &lwork
         ));
         if (lwork > 0) CHECK_CUDA(cudaMalloc(&d_svd_work, lwork * sizeof(real)));
-        std::cout << "Allocated SVD workspace size: " << lwork << " elements (" << (lwork * sizeof(real)) / (1024.0 * 1024.0) << " MiB)" << std::endl;
+        //printf("Allocated SVD workspace size: %d elements (%f MiB)\n", lwork, (lwork * sizeof(real)) / (1024.0 * 1024.0)); // Commented out
 
         // --- 3. Copy Input Data to GPU --- //
-        std::cout << "Copying input data to GPU..." << std::endl;
+        //printf("Copying input data to GPU...\n"); // Commented out
         CHECK_CUDA(cudaMemcpyAsync(d_X, h_X.data(), X_bytes, cudaMemcpyHostToDevice, stream));
         for (int n = 0; n < num_modes; ++n) {
             if(A_sizes_bytes[n] > 0) {
@@ -538,13 +538,13 @@ void tucker_hooi_cuda(
             }
         }
         CHECK_CUDA(cudaStreamSynchronize(stream));
-        std::cout << "Input data copied to GPU." << std::endl;
+        //printf("Input data copied to GPU.\n"); // Commented out
 
         // --- 4. Initialize Factors using HOSVD --- //
         try {
              initialize_factors_svd(d_X, X_dims, R_dims, d_A, cusolverH, cublasH, stream); // Use clamped R_dims
              // Initialize d_A_prev with the results from HOSVD
-             std::cout << "Copying initial factors to d_A_prev..." << std::endl;
+             //printf("Copying initial factors to d_A_prev...\n"); // Commented out
              for(int n=0; n<num_modes; ++n) {
                  if (d_A[n] != nullptr && d_A_prev[n] != nullptr) { // Check for null pointers if size is 0
                      size_t A_bytes = (size_t)X_dims[n] * R_dims[n] * sizeof(real);
@@ -554,12 +554,12 @@ void tucker_hooi_cuda(
               CHECK_CUDA(cudaDeviceSynchronize()); // Sync after init and copy
         } catch (...) {
              // ... (add full cleanup from allocation block) ...
-             std::cerr << "Error during HOSVD initialization." << std::endl;
+             //printf("Error during HOSVD initialization.\n"); // Commented out
              throw;
         }
 
         // --- 5. HOOI Iteration --- //
-        std::cout << "Starting HOOI iterations..." << std::endl;
+        //printf("Starting HOOI iterations...\n"); // Commented out
         real change = tolerance + 1.0f;
         int iter = 0;
 
@@ -720,16 +720,14 @@ void tucker_hooi_cuda(
             iter++;
 
             if (iter % 10 == 0 || change <= tolerance || iter == max_iterations) {
-                 std::cout << "Iter: " << std::setw(4) << iter
-                           << ", Change: " << std::scientific << std::setprecision(6) << change
-                           << std::endl;
+                 //printf("Iter: %4d, Change: %10.6e\n", iter, change); // Commented out
             }
         }
 
-        std::cout << "HOOI iterations finished after " << iter << " iterations." << std::endl;
+        //printf("HOOI iterations finished after %d iterations.\n", iter); // Commented out
 
         // --- 7. Compute Core Tensor G --- //
-        // G = X ×₁ A⁽¹⁾ᵀ ×₂ A⁽²⁾ᵀ ×₃ A⁽³⁾ᵀ ×₄ A⁽⁴⁾ᵀ
+        //printf("Computing core tensor G...\n"); // Commented out
         std::cout << "Computing core tensor G..." << std::endl;
         real* d_current_in = d_X;
         std::vector<int> current_in_dims = X_dims;
@@ -773,9 +771,11 @@ void tucker_hooi_cuda(
             proj_count++;
         }
         CHECK_CUDA(cudaStreamSynchronize(stream));
+        //printf("Core tensor computed.\n"); // Commented out
         std::cout << "Core tensor computed." << std::endl;
 
         // --- 8. Copy Results Back to Host --- //
+        //printf("Copying results back to host...\n"); // Commented out
         std::cout << "Copying results back to host..." << std::endl;
         if (G_size > 0) CHECK_CUDA(cudaMemcpyAsync(h_G.data(), d_G, G_size * sizeof(real), cudaMemcpyDeviceToHost, stream));
         for (int n = 0; n < num_modes; ++n) {
@@ -784,6 +784,7 @@ void tucker_hooi_cuda(
             }
         }
         CHECK_CUDA(cudaStreamSynchronize(stream));
+        //printf("Finished copying results.\n"); // Commented out
         std::cout << "Finished copying results." << std::endl;
 
     } catch (const std::exception& e) {
@@ -817,6 +818,7 @@ void tucker_hooi_cuda(
     }
 
     // --- 9. Cleanup GPU Memory (Success Path / After Catch) --- //
+    //printf("Cleaning up GPU resources...\n"); // Commented out
     std::cout << "Cleaning up GPU resources..." << std::endl;
     if(d_svd_work) CHECK_CUDA(cudaFree(d_svd_work));
     if(d_svd_info) CHECK_CUDA(cudaFree(d_svd_info));
@@ -835,5 +837,6 @@ void tucker_hooi_cuda(
     if (cusolverH) CHECK_CUSOLVER(cusolverDnDestroy(cusolverH));
     if (cublasH) CHECK_CUBLAS(cublasDestroy(cublasH));
 
+    //printf("Tucker decomposition host logic finished.\n"); // Commented out
     std::cout << "Tucker decomposition host logic finished." << std::endl;
 } 
