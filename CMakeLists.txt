@@ -97,10 +97,13 @@ if(BUILD_EXECUTABLE)
     # Link executable against host logic (which includes kernels)
     target_link_libraries(tucker_app PRIVATE
         tucker_host_logic # Links transitively to kernels, cublas, cusolver
-        # CUDA::cudart # Link explicitly if needed
+        CUDA::cudart # Explicitly link CUDA runtime
     )
 
 endif()
 
 # --- Print Status --- #
-message(STATUS "CMake configuration finished.") 
+message(STATUS "CMake configuration finished.")
+
+# Add the tests directory
+add_subdirectory(tests) 
