@@ -4,10 +4,8 @@
 #include <vector>
 #include <string>
 
-// Consistent data type for computations
 using real = float;
 
-// Calculates product of dimensions
 long long product(const std::vector<int>& dims);
 
 /**
@@ -34,4 +32,4 @@ void tucker_hooi_cuda(
     int max_iterations = 100
 );
 
-#endif // HOST_LOGIC_H 
+#endif 

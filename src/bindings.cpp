@@ -19,7 +19,6 @@ py::tuple tucker_hooi_cuda_py(
     real tolerance = 1e-5,
     int max_iterations = 100)
 {
-    // Validate shapes and sizes
     py::buffer_info x_buf = h_X_np.request();
     if (x_buf.ndim != 4) {
         throw std::runtime_error("Input tensor NumPy array must be 4-dimensional.");
@@ -36,11 +35,9 @@ py::tuple tucker_hooi_cuda_py(
         throw std::runtime_error("Target rank list R_dims must have 4 elements.");
     }
 
-    // Copy input tensor
     const real* x_ptr = static_cast<real*>(x_buf.ptr);
     std::vector<real> h_X(x_ptr, x_ptr + x_buf.size);
 
-    // Clamp ranks (needed for allocating output buffers)
     std::vector<int> R_dims_clamped = R_dims_in;
     for(int n=0; n<4; ++n) {
        if (X_dims[n] <= 0 || R_dims_clamped[n] <= 0) {
@@ -48,35 +45,29 @@ py::tuple tucker_hooi_cuda_py(
        }
        R_dims_clamped[n] = std::min(R_dims_clamped[n], X_dims[n]);
        if (R_dims_clamped[n] <= 0) {
-            // This should not happen if inputs are positive, but check clamp result
             throw std::runtime_error("Clamped rank became non-positive for mode " + std::to_string(n));
        }
     }
 
-    // Allocate empty host factor matrix list for C++ function output
     std::vector<std::vector<real>> h_A(4);
     try {
         for (int n = 0; n < 4; ++n) {
             size_t expected_A_size = (size_t)X_dims[n] * R_dims_clamped[n];
             if (expected_A_size > 0)
                 h_A[n].resize(expected_A_size);
-             // No data is copied into h_A from Python
         }
     } catch (const std::bad_alloc& e) {
          throw std::runtime_error("Failed to allocate memory for host factor matrices: " + std::string(e.what()));
     }
 
-    // Prepare output core tensor vector
     long long core_size_ll = product(R_dims_clamped);
     if (core_size_ll < 0) {
         throw std::runtime_error("Invalid clamped ranks resulted in negative core size.");
     }
     std::vector<real> h_G(static_cast<size_t>(core_size_ll));
 
-    // Call C++/CUDA function (which performs HOSVD init internally)
     tucker_hooi_cuda(h_X, X_dims, h_A, h_G, R_dims_in, tolerance, max_iterations);
 
-    // Convert results to NumPy
     std::vector<py::array_t<real>> out_A_list;
     for(int n=0; n<4; ++n) {
          py::array_t<real> a_out_np({(size_t)X_dims[n], (size_t)R_dims_clamped[n]});
@@ -84,7 +75,6 @@ py::tuple tucker_hooi_cuda_py(
          if (h_A[n].size() > 0 && a_out_buf.ptr != nullptr) {
              std::memcpy(a_out_buf.ptr, h_A[n].data(), h_A[n].size() * sizeof(real));
          } else if (h_A[n].size() != static_cast<size_t>(a_out_buf.size)){
-              // Allow zero-size case, but throw if mismatch
               throw std::runtime_error("Factor matrix A" + std::to_string(n+1) + " size mismatch during output conversion.");
          }
          out_A_list.push_back(a_out_np);
@@ -95,7 +85,6 @@ py::tuple tucker_hooi_cuda_py(
      if (h_G.size() > 0 && g_out_buf.ptr != nullptr) {
         std::memcpy(g_out_buf.ptr, h_G.data(), h_G.size() * sizeof(real));
      } else if (h_G.size() != static_cast<size_t>(g_out_buf.size)) {
-         // Allow zero-size case, but throw if mismatch
          throw std::runtime_error("Core tensor size mismatch during output conversion.");
      }
 
