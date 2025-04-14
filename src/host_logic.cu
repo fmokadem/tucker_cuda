@@ -63,6 +63,22 @@ using real = float;
     } while (0)
 #endif
 
+// --- Helper Kernel for NaN/Inf Check ---
+__global__ void check_nan_inf_kernel(const real* data, size_t size, int* result) {
+    // Use a single block, single thread approach for simplicity
+    // Not efficient for large data, but sufficient for debugging
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int has_nan_inf = 0;
+        for (size_t i = 0; i < size; ++i) {
+            if (isnan(data[i]) || isinf(data[i])) {
+                has_nan_inf = 1;
+                break;
+            }
+        }
+        *result = has_nan_inf; 
+    }
+}
+
 // --- Helper Function --- //
 long long product(const std::vector<int>& dims) {
     if (dims.empty()) return 0;
@@ -85,7 +101,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
     cublasHandle_t cublasH,
     cudaStream_t stream
 ) {
-    // DELETED: printf("--- Starting HOSVD Initialization ---\n");
+    //printf("--- Starting HOSVD Initialization ---\n"); // Commented out
     const int num_modes = X_dims.size(); // Should be 4 based on caller checks
 
     if (num_modes != 4 || R_dims.size() != num_modes || d_A.size() != num_modes) {
@@ -124,7 +140,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
     }
 
     if (max_unfold_elements == 0) {
-         // DELETED: printf("Input tensor is empty, skipping HOSVD.\n");
+         //printf("Input tensor is empty, skipping HOSVD.\n"); // Commented out
          // Factors d_A should already be allocated (possibly zero-size) by caller.
          return;
     }
@@ -177,14 +193,14 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         if(d_VT) CHECK_CUDA(cudaFree(d_VT));
         if(d_S) CHECK_CUDA(cudaFree(d_S));
         if(d_X_unfold) CHECK_CUDA(cudaFree(d_X_unfold));
-        // DELETED: printf("Error during HOSVD temporary buffer allocation.\n");
+        //printf("Error during HOSVD temporary buffer allocation.\n"); // Commented out
         throw; // Re-throw the exception
     }
 
 
     // --- 3. Loop Through Modes ---
     for (int n = 0; n < num_modes; ++n) {
-        // DELETED: printf("Initializing factor for mode %d...\n", n);
+        //printf("Initializing factor for mode %d...\n", n); // Commented out
 
         long long current_unfold_rows = X_dims[n]; // I_n
         long long current_unfold_cols = 1;
@@ -197,13 +213,14 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         long long current_unfold_elements = current_unfold_rows * current_unfold_cols;
 
         if (current_unfold_elements == 0 || R_dims[n] == 0) {
-            // DELETED: printf("  Skipping mode %d due to zero dimension or rank.\n", n);
+            //printf("  Skipping mode %d due to zero dimension or rank.\n", n); // Commented out
+            // No need to initialize d_A[n], caller ensures it's allocated (possibly zero size)
             continue;
         }
 
 
         // --- a. Unfold X along mode n ---
-        // DELETED: printf("  Unfolding tensor (mode %d) -> (%lld x %lld)...\n", n, current_unfold_rows, current_unfold_cols);
+        //printf("  Unfolding tensor (mode %d) -> (%lld x %lld)...\n", n, current_unfold_rows, current_unfold_cols); // Commented out
         // Assuming launch_MatricizeKernel unfolds into row-major d_X_unfold[I_n][Others]
         launch_MatricizeKernel(d_X, d_X_unfold, X_dims, n, stream);
         CHECK_CUDA(cudaGetLastError()); // Check kernel launch
@@ -240,7 +257,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         signed char jobvt = 'S'; // Compute first min(m, n) rows of VT = (V')^T = U^T. These rows contain the vectors we need.
                                  // The rows of U^T are the columns of U. Correct.
 
-        // DELETED: printf("  Computing SVD (%d x %d)...\n", svd_m, svd_n_dim);
+        //printf("  Computing SVD (%d x %d)...\n", svd_m, svd_n_dim); // Commented out
         CHECK_CUSOLVER(cusolverDnSgesvd(
             cusolverH,
             jobu,       // Don't compute U'
@@ -267,15 +284,17 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         CHECK_CUDA(cudaMemcpy(&info_host, d_info, sizeof(int), cudaMemcpyDeviceToHost));
         if (info_host < 0) {
              std::string msg = "HOSVD Error: cusolverDnSgesvd argument " + std::to_string(-info_host) + " was illegal for mode " + std::to_string(n) + ".";
-             // DELETED: printf("HOSVD Error: %s\n", msg.c_str());
+             //printf("HOSVD Error: %s\n", msg.c_str()); // Commented out
              throw std::runtime_error(msg);
         } else if (info_host > 0) {
-             // DELETED: printf("HOSVD Warning: cusolverDnSgesvd did not converge for mode %d. %d superdiagonals failed to converge.\n", n, info_host);
+             // Non-convergence might not be fatal for initialization, print warning.
+             //printf("HOSVD Warning: cusolverDnSgesvd did not converge for mode %d. %d superdiagonals failed to converge.\n", n, info_host); // Commented out
+             // Continue, the computed factors might still be usable.
         }
 
 
-        // --- d. Extract Factor A^(n) --- Step 1: Transpose VT submatrix -> Temp ColMajor ---
-        // DELETED: printf("  Extracting factor A[%d] (size %d x %d)... Step 1/2\n", n, In, Rn);
+        // --- d. Extract Factor A^(n) --- Step 1: Transpose VT submatrix -> Temp ColMajor --- 
+        //printf("  Extracting factor A[%d] (size %d x %d)... Step 1/2\n", n, In, Rn); // Commented out
         int Rn = R_dims[n]; // Target rank for this mode
         int In = X_dims[n]; // Dimension for this mode
 
@@ -305,7 +324,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
         CHECK_CUDA(cudaDeviceSynchronize()); // Sync after first transpose
 
         // --- d. Extract Factor A^(n) --- Step 2: Transpose Temp ColMajor -> Final RowMajor d_A[n] ---
-        // DELETED: printf("  Extracting factor A[%d] ... Step 2/2\n", n);
+        //printf("  Extracting factor A[%d] ... Step 2/2\n", n); // Commented out
         // Second transpose: d_Tmp_ColMajor (In x Rn, ld=In) -> d_A[n] (In x Rn, ld=Rn)
         // C = alpha * op(A) + beta * op(B)
         // C = d_A[n] (m=Rn, n=In, ldc=Rn)
@@ -329,12 +348,12 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
                                 ));
         CHECK_CUDA(cudaDeviceSynchronize()); // Sync after second transpose
 
-        // DELETED: printf("  Factor A[%d] initialized.\n", n);
+        //printf("  Factor A[%d] initialized.\n", n); // Commented out
 
     } // End For loop n
 
     // --- 4. Cleanup Temporary Buffers ---
-    // DELETED: printf("Cleaning up temporary HOSVD buffers...\n");
+    //printf("Cleaning up temporary HOSVD buffers...\n"); // Commented out
     if (d_Tmp_ColMajor) CHECK_CUDA(cudaFree(d_Tmp_ColMajor)); // Free temp transpose buffer
     if (d_dummy_B) CHECK_CUDA(cudaFree(d_dummy_B));
     CHECK_CUDA(cudaFree(d_svd_work));
@@ -343,7 +362,7 @@ void initialize_factors_svd( // Renamed from pseudocode 'initialize_factors_hosv
     CHECK_CUDA(cudaFree(d_S));
     CHECK_CUDA(cudaFree(d_X_unfold));
 
-    // DELETED: printf("--- HOSVD Initialization Complete ---\n");
+    //printf("--- HOSVD Initialization Complete ---\n"); // Commented out
 }
 
 // --- Main Host Logic for CUDA-accelerated Tucker Decomposition (HOOI) ---
@@ -397,7 +416,7 @@ void tucker_hooi_cuda(
         }
         R_dims[n] = std::min(R_dims[n], X_dims[n]);
     }
-    // DELETED: printf("Using clamped ranks: [%d, %d, %d, %d]\n", R_dims[0], R_dims[1], R_dims[2], R_dims[3]);
+    //printf("Using clamped ranks: [%d, %d, %d, %d]\n", R_dims[0], R_dims[1], R_dims[2], R_dims[3]); // Commented out
 
     long long X_size = product(X_dims);
     long long G_size = product(R_dims);
@@ -456,6 +475,8 @@ void tucker_hooi_cuda(
     real *d_S_svd = nullptr;
     real *d_svd_work = nullptr;
     int *d_svd_info = nullptr;
+    real *d_dummy_B = nullptr; // Add dummy buffer pointer
+    real *d_Tmp_ColMajor = nullptr; // Add buffer for 2-step transpose
 
     // RAII class or unique_ptr would be safer for cleanup
     try {
@@ -524,10 +545,21 @@ void tucker_hooi_cuda(
             &lwork
         ));
         if (lwork > 0) CHECK_CUDA(cudaMalloc(&d_svd_work, lwork * sizeof(real)));
-        // DELETED: printf("Allocated SVD workspace size: %d elements (%f MiB)\n", lwork, (lwork * sizeof(real)) / (1024.0 * 1024.0));
+        // Allocate dummy buffer for sgeam (needs to be large enough for max call)
+        int max_sgeam_m = 0;
+        int max_sgeam_n = 0;
+        for(int n=0; n<num_modes; ++n) {
+            max_sgeam_m = std::max(max_sgeam_m, X_dims[n]); // I_n
+            max_sgeam_n = std::max(max_sgeam_n, R_dims[n]); // R_n
+        }
+        if (max_sgeam_m > 0 && max_sgeam_n > 0) {
+            CHECK_CUDA(cudaMalloc(&d_dummy_B, (size_t)max_sgeam_m * max_sgeam_n * sizeof(real)));
+            // Allocate Temp buffer (size I_n x R_n, col-major)
+            CHECK_CUDA(cudaMalloc(&d_Tmp_ColMajor, (size_t)max_sgeam_m * max_sgeam_n * sizeof(real)));
+        }
 
         // --- 3. Copy Input Data to GPU --- //
-        // DELETED: printf("Copying input data to GPU...\n");
+        //printf("Copying input data to GPU...\n"); // Commented out
         CHECK_CUDA(cudaMemcpyAsync(d_X, h_X.data(), X_bytes, cudaMemcpyHostToDevice, stream));
         for (int n = 0; n < num_modes; ++n) {
             if(A_sizes_bytes[n] > 0) {
@@ -535,12 +567,13 @@ void tucker_hooi_cuda(
             }
         }
         CHECK_CUDA(cudaStreamSynchronize(stream));
-        // DELETED: printf("Input data copied to GPU.\n");
+        //printf("Input data copied to GPU.\n"); // Commented out
 
         // --- 4. Initialize Factors using HOSVD --- //
         try {
-             initialize_factors_svd(d_X, X_dims, R_dims, d_A, cusolverH, cublasH, stream);
-             // DELETED: printf("Copying initial factors to d_A_prev...\n");
+             initialize_factors_svd(d_X, X_dims, R_dims, d_A, cusolverH, cublasH, stream); // Use clamped R_dims
+             // Initialize d_A_prev with the results from HOSVD
+             //printf("Copying initial factors to d_A_prev...\n"); // Commented out
              for(int n=0; n<num_modes; ++n) {
                  if (d_A[n] != nullptr && d_A_prev[n] != nullptr) { // Check for null pointers if size is 0
                      size_t A_bytes = (size_t)X_dims[n] * R_dims[n] * sizeof(real);
@@ -550,17 +583,18 @@ void tucker_hooi_cuda(
               CHECK_CUDA(cudaDeviceSynchronize()); // Sync after init and copy
         } catch (...) {
              // ... (add full cleanup from allocation block) ...
-             // DELETED: printf("Error during HOSVD initialization.\n");
+             //printf("Error during HOSVD initialization.\n"); // Commented out
              throw;
         }
 
         // --- 5. HOOI Iteration --- //
-        // DELETED: printf("Starting HOOI iterations...\n");
+        //printf("Starting HOOI iterations...\n"); // Commented out
         real change = tolerance + 1.0f;
         int iter = 0;
 
         while (change > tolerance && iter < max_iterations) {
-            // Copy current factors to previous
+            change = 0.0f;
+
             for (int n = 0; n < num_modes; ++n) {
                 if(A_sizes_bytes[n] > 0) {
                     CHECK_CUDA(cudaMemcpyAsync(d_A_prev[n], d_A[n], A_sizes_bytes[n], cudaMemcpyDeviceToDevice, stream));
@@ -633,115 +667,89 @@ void tucker_hooi_cuda(
 
 
                 if (svd_m > 0 && svd_n > 0) {
-                    int lda_svd = svd_m;
-                    // VT output is k x n = min(m,n) x I_n. LD is n.
-                    int ldvt_svd = svd_n;
+                    // ---- Workaround for Rank1All SVD issue ----
+                    if (svd_m == 1) {
+                        // Y_(n)^T has dims 1 x I_n. The SVD factor A^(n) is just normalized Y_(n)
+                        // Input d_Y_unfolded contains Y_(n)^T (1 x I_n)
+                        real input_norm = 0.0f;
+                        CHECK_CUBLAS(cublasSnrm2(cublasH, svd_n, d_Y_unfolded, 1, &input_norm));
+                        //printf("  DEBUG (Rank1All WORKAROUND): SVD input norm for mode %d (m=1, n=%lld): %e\n", n_update, svd_n, input_norm);
+                        
+                        // Copy d_Y_unfolded to d_A[n_update]
+                        CHECK_CUDA(cudaMemcpyAsync(d_A[n_update], d_Y_unfolded, svd_n * sizeof(real), cudaMemcpyDeviceToDevice, stream));
+                        
+                        // Normalize d_A[n_update] in place
+                        if (input_norm > 1e-12f) { // Avoid division by zero/small number
+                            real scale = 1.0f / input_norm;
+                            CHECK_CUBLAS(cublasSscal(cublasH, svd_n, &scale, d_A[n_update], 1));
+                        } else {
+                            // If norm is zero, the factor is zero (or handle as error/special case if needed)
+                             CHECK_CUDA(cudaMemsetAsync(d_A[n_update], 0, svd_n * sizeof(real), stream));
+                             // Optionally, print a warning or throw an error if zero norm is unexpected
+                             // printf("  WARNING: Zero norm SVD input for mode %d in Rank1All case.\n", n_update);
+                        }
+                    } else { // Original SVD path for svd_m > 1
+                        int lda_svd = svd_m;
+                        int ldvt_svd = svd_n;
 
-                    // Want U from SVD(Y_(n)). Compute SVD(Z=Y_(n)^T) = U_z S V_z^T.
-                    // Y_(n) = Z^T = V_z S U_z^T. U of Y_(n) is V_z.
-                    // Need VT output (V_z^T) from SVD(Z).
-                    // The first R_n rows of VT are needed.
-                    CHECK_CUSOLVER(cusolverDnSgesvd(
-                        cusolverH,
-                        'N',
-                        'S',
-                        svd_m,
-                        svd_n,
-                        d_Y_unfolded,
-                        lda_svd,
-                        d_S_svd,
-                        nullptr,
-                        svd_m,
-                        d_VT_svd,
-                        ldvt_svd,
-                        d_svd_work,
-                        lwork,
-                        nullptr,
-                        d_svd_info
-                    ));
+                        // ---- DEBUG: Check SVD input for NaN/Inf ----
+                        int* d_nan_inf_result = nullptr;
+                        int h_nan_inf_result = 0;
+                        size_t unfold_elements = (size_t)svd_m * svd_n;
+                        if (unfold_elements > 0) {
+                            CHECK_CUDA(cudaMalloc(&d_nan_inf_result, sizeof(int)));
+                            CHECK_CUDA(cudaMemsetAsync(d_nan_inf_result, 0, sizeof(int), stream));
+                            check_nan_inf_kernel<<<1, 1, 0, stream>>>(d_Y_unfolded, unfold_elements, d_nan_inf_result);
+                            CHECK_CUDA(cudaMemcpyAsync(&h_nan_inf_result, d_nan_inf_result, sizeof(int), cudaMemcpyDeviceToHost, stream));
+                            CHECK_CUDA(cudaStreamSynchronize(stream));
+                            CHECK_CUDA(cudaFree(d_nan_inf_result)); 
+                            if (h_nan_inf_result != 0) {
+                                printf("  WARNING: NaN/Inf detected in SVD input d_Y_unfolded (mode %d)\n", n_update);
+                                // Optionally throw an error or handle differently
+                                // throw std::runtime_error("NaN/Inf in SVD input");
+                            }
+                        }
+                        // ---- END DEBUG ----
 
-                    // Optional: Check SVD convergence info
-                    // int h_svd_info = 0;
-                    // CHECK_CUDA(cudaMemcpyAsync(&h_svd_info, d_svd_info, sizeof(int), cudaMemcpyDeviceToHost, stream));
-                    // CHECK_CUDA(cudaStreamSynchronize(stream));
-                    // if (h_svd_info < 0) { throw std::runtime_error("SVD failed: invalid argument"); }
-                    // else if (h_svd_info > 0) { std::cerr << "Warning: SVD did not converge..." << std::endl; }
+                        // Want U from SVD(Y_(n)). Compute SVD(Z=Y_(n)^T) = U_z S V_z^T.
+                        CHECK_CUSOLVER(cusolverDnSgesvd(
+                            cusolverH,
+                            'N',
+                            'S',
+                            svd_m,
+                            svd_n,
+                            d_Y_unfolded,
+                            lda_svd,
+                            d_S_svd,
+                            nullptr,
+                            svd_m,
+                            d_VT_svd,
+                            ldvt_svd,
+                            d_svd_work,
+                            lwork,
+                            nullptr,
+                            d_svd_info
+                        ));
 
-                    // d) Update A^(n) = transpose(VT[0:R_n-1, :])
-                    real alpha = 1.0f;
-                    real beta = 0.0f;
-                    // C(I_n, R_n) = alpha * op(A(k, I_n)) + beta * op(B)
-                    // op(A) = T. A is first R_n rows of VT.
-                    CHECK_CUBLAS(cublasSgeam(
-                        cublasH,
-                        CUBLAS_OP_T,
-                        CUBLAS_OP_N,
-                        svd_n,              // Rows of C (I_n)
-                        R_dims[n_update],   // Cols of C (R_n)
-                        &alpha,
-                        d_VT_svd,           // A = VT (k x I_n)
-                        ldvt_svd,           // lda = I_n
-                        &beta,
-                        nullptr,
-                        svd_n,
-                        d_A[n_update],      // C = A^(n) (I_n x R_n)
-                        svd_n               // ldc = I_n
-                    ));
+                        // ... (rest of two-step transpose using d_VT_svd) ...
+                        real alpha = 1.0f;
+                        real beta = 0.0f;
+                        int Rn = R_dims[n_update];
+                        int In = svd_n;
+
+                        CHECK_CUBLAS(cublasSgeam(cublasH, CUBLAS_OP_T, CUBLAS_OP_N, In, Rn, &alpha, d_VT_svd, ldvt_svd, &beta, d_dummy_B, In, d_Tmp_ColMajor, In));
+                        CHECK_CUBLAS(cublasSgeam(cublasH, CUBLAS_OP_T, CUBLAS_OP_N, Rn, In, &alpha, d_Tmp_ColMajor, In, &beta, d_dummy_B, Rn, d_A[n_update], Rn));
+                    }
+                    // ---- End Workaround ----
                 } else { // Handle zero-sized SVD input
                      if (A_sizes_bytes[n_update] > 0) {
                          CHECK_CUDA(cudaMemsetAsync(d_A[n_update], 0, A_sizes_bytes[n_update], stream));
                      }
                  }
             }
-            CHECK_CUDA(cudaStreamSynchronize(stream)); // Ensure factor updates are complete
 
-            // --- ADDED: Compute Core Tensor G within the loop ---
-            if (G_size > 0) {
-                 // G = X ×₁ A⁽¹⁾ᵀ ×₂ A⁽²⁾ᵀ ×₃ A⁽³⁾ᵀ ×₄ A⁽⁴⁾ᵀ
-                 real* d_core_in = d_X;
-                 std::vector<int> core_in_dims = X_dims;
-                 real* d_core_out = nullptr;
-                 int core_proj_count = 0;
-
-                 for (int n = 0; n < num_modes; ++n) {
-                     std::vector<int> core_out_dims = core_in_dims;
-                     core_out_dims[n] = R_dims[n];
-                     std::vector<int> factor_dims_n = {X_dims[n], R_dims[n]};
-
-                     bool is_last_core_step = (n == num_modes - 1);
-                     d_core_out = is_last_core_step ? d_G : ((core_proj_count % 2 == 0) ? d_Y_projected1 : d_Y_projected2);
-
-                     if (!is_last_core_step && !d_core_out) {
-                         throw std::runtime_error("Intermediate buffer is null during core tensor computation inside loop.");
-                     }
-                     if (is_last_core_step && !d_G) {
-                          throw std::runtime_error("Core tensor buffer d_G is null when needed inside loop.");
-                     }
-
-                    if (product(core_in_dims) > 0 && product(factor_dims_n) > 0) {
-                         launch_nModeProductKernel(
-                             d_core_in,
-                             d_core_out,
-                             d_A[n],
-                             core_in_dims,
-                             core_out_dims,
-                             factor_dims_n,
-                             n,
-                             true, // Use Transpose
-                             stream
-                         );
-                     } else if (product(core_out_dims) > 0) {
-                          CHECK_CUDA(cudaMemsetAsync(d_core_out, 0, product(core_out_dims) * sizeof(real), stream));
-                     }
-                     d_core_in = d_core_out;
-                     core_in_dims = core_out_dims;
-                     core_proj_count++;
-                 }
-                 CHECK_CUDA(cudaStreamSynchronize(stream)); // Sync core computation
-            }
-            // --- END ADDED: Core Tensor Computation ---
-
-            // --- Check Convergence ---
+            // --- 6. Check Convergence --- //
+            // Calculate sum ||A^(n) - A_prev^(n)||^2_F
             change = 0.0f;
             for (int n = 0; n < num_modes; ++n) {
                 if (A_element_counts[n] > 0) {
@@ -757,21 +765,75 @@ void tucker_hooi_cuda(
             if (change > 0.0f) {
                  change = sqrt(change);
             }
+
             iter++;
+
             if (iter % 10 == 0 || change <= tolerance || iter == max_iterations) {
-                 printf("Iter: %4d, Change: %10.6e\n", iter, change); // Keep iteration progress
+                 //printf("Iter: %4d, Change: %10.6e\n", iter, change); // Commented out
             }
-        } // End while loop
+        }
 
-        // DELETED: printf("HOOI iterations finished after %d iterations.\n", iter);
+        //printf("HOOI iterations finished after %d iterations.\n", iter); // Commented out
 
-        // --- Compute Core Tensor G --- MOVED INSIDE LOOP
-        // DELETED: printf("Computing core tensor G...\n");
-        // DELETED: Core computation logic block here
-        // DELETED: printf("Core tensor computed.\n");
+        // --- 7. Compute Core Tensor G --- //
+        //printf("Computing core tensor G...\n"); // Commented out
+        std::cout << "Computing core tensor G..." << std::endl;
+        real* d_current_in = d_X;
+        std::vector<int> current_in_dims = X_dims;
+        real* d_current_out = nullptr;
+        int proj_count = 0;
+
+        for (int n = 0; n < num_modes; ++n) {
+            std::vector<int> current_out_dims = current_in_dims;
+            current_out_dims[n] = R_dims[n];
+            std::vector<int> factor_dims_n = {X_dims[n], R_dims[n]};
+
+            bool is_last_step = (n == num_modes - 1);
+            d_current_out = is_last_step ? d_G : ((proj_count % 2 == 0) ? d_Y_projected1 : d_Y_projected2);
+
+            // Check for null buffers before launch
+            if (!is_last_step && !d_current_out) {
+                 throw std::runtime_error("Intermediate buffer is null during core tensor computation.");
+            }
+            if (is_last_step && G_size > 0 && !d_G) {
+                 throw std::runtime_error("Core tensor buffer d_G is null when needed.");
+            }
+
+            if (product(current_in_dims) > 0 && product(factor_dims_n) > 0) {
+                 launch_nModeProductKernel(
+                     d_current_in,
+                     d_current_out,
+                     d_A[n],
+                     current_in_dims,
+                     current_out_dims,
+                     factor_dims_n,
+                     n,
+                     true, // Use Transpose
+                     stream
+                 );
+             } else if (product(current_out_dims) > 0) {
+                 CHECK_CUDA(cudaMemsetAsync(d_current_out, 0, product(current_out_dims) * sizeof(real), stream));
+             }
+
+            d_current_in = d_current_out;
+            current_in_dims = current_out_dims;
+            proj_count++;
+        }
+        CHECK_CUDA(cudaStreamSynchronize(stream));
+        //printf("Core tensor computed.\n"); // Keep commented
+        //std::cout << "Core tensor computed." << std::endl;
+
+        // ---- DEBUG: Check computed core tensor norm ----
+        if (G_size > 0 && d_G != nullptr) {
+            real core_norm = 0.0f;
+            CHECK_CUBLAS(cublasSnrm2(cublasH, G_size, d_G, 1, &core_norm));
+            printf("  DEBUG: Computed core tensor G norm: %e\n", core_norm);
+        }
+        // ---- END DEBUG ----
 
         // --- 8. Copy Results Back to Host --- //
-        // DELETED: printf("Copying results back to host...\n");
+        //printf("Copying results back to host...\n"); // Commented out
+        std::cout << "Copying results back to host..." << std::endl;
         if (G_size > 0) CHECK_CUDA(cudaMemcpyAsync(h_G.data(), d_G, G_size * sizeof(real), cudaMemcpyDeviceToHost, stream));
         for (int n = 0; n < num_modes; ++n) {
             if(A_sizes_bytes[n] > 0) {
@@ -779,7 +841,9 @@ void tucker_hooi_cuda(
             }
         }
         CHECK_CUDA(cudaStreamSynchronize(stream));
-        // DELETED: printf("Finished copying results.\n");
+        //printf("Finished copying results.\n"); // Commented out
+        std::cout << "Finished copying results." << std::endl;
+
     } catch (const std::exception& e) {
         std::cerr << "Error during HOOI execution: " << e.what() << std::endl;
         if (cusolverH) cusolverDnDestroy(cusolverH);
@@ -806,13 +870,18 @@ void tucker_hooi_cuda(
         if (cusolverH) cusolverDnDestroy(cusolverH);
         if (cublasH) cublasDestroy(cublasH);
 
+        if (d_Tmp_ColMajor) CHECK_CUDA(cudaFree(d_Tmp_ColMajor)); // Free temp transpose buffer
+        if (d_dummy_B) CHECK_CUDA(cudaFree(d_dummy_B)); // Free the dummy buffer
+
         std::cerr << "GPU memory cleanup attempted." << std::endl;
         throw;
     }
 
     // --- 9. Cleanup GPU Memory (Success Path / After Catch) --- //
-    // DELETED: printf("Cleaning up GPU resources...\n");
+    //printf("Cleaning up GPU resources...\n"); // Keep commented
     std::cout << "Cleaning up GPU resources..." << std::endl;
+    if(d_Tmp_ColMajor) CHECK_CUDA(cudaFree(d_Tmp_ColMajor)); // Free temp transpose buffer
+    if(d_dummy_B) CHECK_CUDA(cudaFree(d_dummy_B)); // Free the dummy buffer
     if(d_svd_work) CHECK_CUDA(cudaFree(d_svd_work));
     if(d_svd_info) CHECK_CUDA(cudaFree(d_svd_info));
     if(d_S_svd) CHECK_CUDA(cudaFree(d_S_svd));
@@ -830,6 +899,6 @@ void tucker_hooi_cuda(
     if (cusolverH) CHECK_CUSOLVER(cusolverDnDestroy(cusolverH));
     if (cublasH) CHECK_CUBLAS(cublasDestroy(cublasH));
 
-    // DELETED: printf("Tucker decomposition host logic finished.\n");
+    //printf("Tucker decomposition host logic finished.\n"); // Commented out
     std::cout << "Tucker decomposition host logic finished." << std::endl;
 } 
