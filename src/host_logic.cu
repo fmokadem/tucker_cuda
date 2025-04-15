@@ -383,7 +383,7 @@ void tucker_hooi_cuda(
     // implementation produces results with:
     //   1. High Relative Reconstruction Error: The computed core and factors
     //      do not accurately reconstruct the original tensor.
-    //   2. Lack of Factor Orthogonality: The computed factor matrices (A_n)
+    //   (FIXED by forcing init factors with HOSVD) 2. Lack of Factor Orthogonality: The computed factor matrices (A_n)
     //      are not sufficiently orthogonal (||A_n^T * A_n - I|| is large).
     //
     // This suggests potential problems within the main HOOI iteration loop below,
